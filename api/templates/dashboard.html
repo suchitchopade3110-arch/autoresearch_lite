@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="refresh" content="10">
+  <title>Autoresearch Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 p-6 max-w-5xl mx-auto">
+  <h1 class="text-2xl font-bold mb-1">Autoresearch Dashboard</h1>
+  <p class="text-sm text-slate-500 mb-6">Auto-refreshes every 10s &middot; generated {{ kpis.generated_at }}</p>
+
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+    <div class="bg-white rounded-lg shadow p-4">
+      <div class="text-xs uppercase text-slate-500">Merge rate</div>
+      <div class="text-2xl font-semibold">{{ "%.0f"|format(kpis.merge_rate * 100) }}%</div>
+      <div class="text-xs text-slate-400">{{ kpis.success_count }}/{{ kpis.total_experiments }} experiments</div>
+    </div>
+    <div class="bg-white rounded-lg shadow p-4">
+      <div class="text-xs uppercase text-slate-500">Duplicate avoidance</div>
+      <div class="text-2xl font-semibold">{{ "%.0f"|format(kpis.duplicate_avoidance_rate * 100) }}%</div>
+      <div class="text-xs text-slate-400">{{ kpis.duplicates_avoided }} avoided</div>
+    </div>
+    <div class="bg-white rounded-lg shadow p-4">
+      <div class="text-xs uppercase text-slate-500">Compute / improvement</div>
+      <div class="text-2xl font-semibold">
+        {% if kpis.compute_cost_per_improvement_seconds is not none %}
+          {{ "%.2f"|format(kpis.compute_cost_per_improvement_seconds) }}s
+        {% else %}
+          n/a
+        {% endif %}
+      </div>
+      <div class="text-xs text-slate-400">{{ "%.1f"|format(kpis.total_compute_seconds) }}s total</div>
+    </div>
+    <div class="bg-white rounded-lg shadow p-4">
+      <div class="text-xs uppercase text-slate-500">Approval timeout rate</div>
+      <div class="text-2xl font-semibold">{{ "%.0f"|format(kpis.approvals.timeout_rate * 100) }}%</div>
+      <div class="text-xs text-slate-400">{{ kpis.approvals.pending }} pending now</div>
+    </div>
+  </div>
+
+  <h2 class="text-lg font-semibold mb-3">Pending approvals ({{ pending|length }})</h2>
+  {% if not pending %}
+    <p class="text-sm text-slate-500 mb-8">Nothing waiting on a decision.</p>
+  {% else %}
+  <div class="space-y-3 mb-8">
+    {% for req in pending %}
+    <div class="bg-white rounded-lg shadow p-4">
+      <div class="flex justify-between items-start mb-2">
+        <div>
+          <div class="font-mono text-xs text-slate-500">{{ req.candidate_id }}</div>
+          <div class="font-medium">{{ req.goal }}</div>
+          <div class="text-sm text-slate-600">score: {{ "%.4f"|format(req.final_score) }} &middot; requested {{ req.created_at }}</div>
+        </div>
+        <div class="flex gap-2">
+          <form method="post" action="/approvals/{{ req.id }}/approve">
+            <button class="bg-emerald-600 text-white px-3 py-1 rounded text-sm hover:bg-emerald-700">Approve</button>
+          </form>
+          <form method="post" action="/approvals/{{ req.id }}/reject">
+            <button class="bg-red-600 text-white px-3 py-1 rounded text-sm hover:bg-red-700">Reject</button>
+          </form>
+        </div>
+      </div>
+      <details class="text-xs text-slate-600">
+        <summary class="cursor-pointer">diff</summary>
+        <pre class="whitespace-pre-wrap bg-slate-100 rounded p-2 mt-1">{{ req.diff }}</pre>
+      </details>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <h2 class="text-lg font-semibold mb-3">Recent decisions</h2>
+  {% if not decided %}
+    <p class="text-sm text-slate-500 mb-8">None yet.</p>
+  {% else %}
+  <div class="overflow-x-auto mb-8">
+    <table class="w-full text-sm bg-white rounded-lg shadow">
+      <thead class="text-left text-slate-500 border-b">
+        <tr><th class="p-2">Candidate</th><th class="p-2">Status</th><th class="p-2">Score</th><th class="p-2">Decided</th><th class="p-2">Note</th></tr>
+      </thead>
+      <tbody>
+        {% for a in decided %}
+        <tr class="border-b last:border-0">
+          <td class="p-2 font-mono text-xs">{{ a.candidate_id }}</td>
+          <td class="p-2">
+            <span class="px-2 py-0.5 rounded text-xs
+              {% if a.status == 'approved' %}bg-emerald-100 text-emerald-800
+              {% elif a.status == 'rejected' %}bg-red-100 text-red-800
+              {% else %}bg-amber-100 text-amber-800{% endif %}">{{ a.status }}</span>
+          </td>
+          <td class="p-2">{{ "%.4f"|format(a.final_score) }}</td>
+          <td class="p-2 text-xs text-slate-500">{{ a.decided_at }}</td>
+          <td class="p-2 text-xs text-slate-500">{{ a.decision_note or "" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  <h2 class="text-lg font-semibold mb-3">Experiment history</h2>
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm bg-white rounded-lg shadow">
+      <thead class="text-left text-slate-500 border-b">
+        <tr><th class="p-2">Hypothesis</th><th class="p-2">Outcome</th><th class="p-2">When</th></tr>
+      </thead>
+      <tbody>
+        {% for e in history %}
+        <tr class="border-b last:border-0">
+          <td class="p-2">{{ e.hypothesis }}</td>
+          <td class="p-2">
+            <span class="px-2 py-0.5 rounded text-xs
+              {% if e.outcome == 'success' %}bg-emerald-100 text-emerald-800
+              {% elif e.outcome == 'held' %}bg-amber-100 text-amber-800
+              {% else %}bg-red-100 text-red-800{% endif %}">{{ e.outcome }}</span>
+          </td>
+          <td class="p-2 text-xs text-slate-500">{{ e.created_at }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>

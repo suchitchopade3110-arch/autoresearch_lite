@@ -7,7 +7,7 @@ def test_full_loop_phase2():
     # Create a temporary directory to act as the repository
     with tempfile.TemporaryDirectory() as temp_repo:
         # Copy the project files to the temp directory
-        for item in ["configs", "orchestrator", "eval", "sandbox", "vcs", "memory", "generation"]:
+        for item in ["configs", "orchestrator", "eval", "sandbox", "vcs", "memory", "generation", "approval", "reporting"]:
             shutil.copytree(item, os.path.join(temp_repo, item))
 
         # create gitignore to prevent chroma_db from being tracked and failing git checkouts
@@ -16,6 +16,14 @@ def test_full_loop_phase2():
 
         with open(os.path.join(temp_repo, "candidate_script.py"), "w") as f:
             f.write("\n")
+
+        # Unattended run, no dashboard operator present - see test_integration.py
+        config_path = os.path.join(temp_repo, "configs", "example.yaml")
+        with open(config_path) as f:
+            config_text = f.read()
+        config_text = config_text.replace("  enabled: true", "  enabled: false")
+        with open(config_path, "w") as f:
+            f.write(config_text)
 
         # Initialize a new git repository
         subprocess.run(["git", "init"], cwd=temp_repo, check=True)
