@@ -1,0 +1,18 @@
+sandbox:
+  timeout_seconds: 5
+  cpu_limit: "0.5"
+  memory_limit: "256m"
+
+dataset:
+  path: "dummy_data/"
+
+eval:
+  stages:
+    - subset_percentage: 1
+      threshold: 0.5
+    - subset_percentage: 5
+      threshold: 0.6
+    - subset_percentage: 20
+      threshold: 0.7
+    - subset_percentage: 100
+      threshold: 0.8
