@@ -1,5 +1,6 @@
 import subprocess
 import os
+import sys
 import tempfile
 import shutil
 
@@ -34,7 +35,8 @@ def test_full_loop_phase3_evolution():
         env["PYTHONPATH"] = temp_repo
 
         goal = "Test Phase 3 Evolution"
-        cmd = ["python", "-m", "orchestrator.run", "--config", "configs/example.yaml", "--goal", goal, "--mode", "evolutionary"]
+        # sys.executable, not a bare "python" - see test_integration.py
+        cmd = [sys.executable, "-m", "orchestrator.run", "--config", "configs/example.yaml", "--goal", goal, "--mode", "evolutionary"]
 
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=temp_repo, env=env)
 
