@@ -1,22 +1,31 @@
+import os
 import subprocess
 import time
-from typing import Dict, Any
+import uuid
+from typing import Any, Dict, Optional
+
 
 class SandboxExecutor:
     """
     Executes a script inside a Docker sandbox.
 
     SECURITY NOTE:
-    This sandbox enforces wall-clock timeout and CPU/memory constraints via Docker.
-    It does NOT protect against deliberate malicious breakouts. Do not run untrusted
-    malware here. It's meant for safe experimental ML code.
+    Runs as a non-root user with no network access, a read-only root
+    filesystem, and dropped capabilities, on top of the wall-clock
+    timeout and CPU/memory limits. This raises the bar against a
+    candidate script trying to exfiltrate data, persist state, or exceed
+    its resource limits, but it is still a standard container, not a
+    hardened micro-VM - it does NOT protect against a deliberate kernel
+    exploit or container escape. Do not run untrusted malware here.
     """
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], dataset_path: Optional[str] = None):
         self.timeout = config.get('timeout_seconds', 10)
         self.cpu_limit = config.get('cpu_limit', '1.0')
         self.memory_limit = config.get('memory_limit', '512m')
-
-        # Build the image once when executor is instantiated (or could be external)
+        # Mounted read-only into every sandbox run if set, so callers (the
+        # sequential loop and the concurrent evolutionary scheduler alike)
+        # don't each need to know about dataset wiring individually.
+        self.dataset_path = os.path.abspath(dataset_path) if dataset_path else None
         self._build_image()
 
     def _build_image(self):
@@ -26,27 +35,33 @@ class SandboxExecutor:
             capture_output=True
         )
 
-    def run_candidate(self, script_path: str, env_vars: Dict[str, str] = None) -> Dict[str, Any]:
+    def run_candidate(self, script_path: str, env_vars: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """Runs the given script inside the docker sandbox."""
         start_time = time.time()
-
-        import uuid
         container_name = f"sandbox-{uuid.uuid4().hex[:8]}"
+
         cmd = [
             "docker", "run", "--rm",
             f"--name={container_name}",
             f"--cpus={self.cpu_limit}",
             f"--memory={self.memory_limit}",
+            "--network", "none",
+            "--read-only",
+            "--tmpfs", "/tmp",
+            "--security-opt", "no-new-privileges",
+            "--cap-drop", "ALL",
+            "-v", f"{script_path}:/app/candidate_script.py:ro",
         ]
 
-        if env_vars:
-            for k, v in env_vars.items():
-                cmd.extend(["-e", f"{k}={v}"])
+        run_env = dict(env_vars or {})
+        if self.dataset_path:
+            cmd += ["-v", f"{self.dataset_path}:/app/data/dataset.jsonl:ro"]
+            run_env.setdefault("DATASET_PATH", "/app/data/dataset.jsonl")
 
-        cmd.extend([
-            "-v", f"{script_path}:/app/candidate_script.py:ro",
-            "ml-sandbox"
-        ])
+        for key, value in run_env.items():
+            cmd += ["-e", f"{key}={value}"]
+
+        cmd.append("ml-sandbox")
 
         try:
             result = subprocess.run(

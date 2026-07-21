@@ -1,12 +1,18 @@
 import concurrent.futures
-import threading
 import os
-import shutil
-from typing import List, Dict, Any, Callable
+import threading
+from typing import Any, Callable, Dict, List
+
+from generation.patch_generator import validate_and_apply_patch
+
 
 class ConcurrentScheduler:
     def __init__(self, max_workers: int):
         self.max_workers = max_workers
+        # Each candidate now gets its own git worktree, so patch application,
+        # commit, and sandbox execution never share a checkout - only the
+        # repo-level branch/merge/rollback calls below still touch the
+        # single shared git_controller.repo object and need serializing.
         self.git_lock = threading.Lock()
 
     def execute_generation(self,
@@ -22,43 +28,24 @@ class ConcurrentScheduler:
         def process_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
             c_id = candidate['id']
             diff = candidate['diff']
-            goal = candidate.get('goal', 'Optimization goal')
-
-            import tempfile
-            temp_dir = tempfile.mkdtemp(prefix=f"sandbox_exec_{c_id}_")
-            script_path = os.path.join(temp_dir, "candidate_script.py")
-
-            with open(script_path, "w") as f:
-                f.write("\n")
 
             branch_name = None
+            worktree_path = None
 
             try:
                 with self.git_lock:
-                    branch_name = git_controller.create_branch(c_id)
+                    branch_name, worktree_path = git_controller.create_branch(c_id)
 
-                    if diff.strip():
-                        patch_file = f"temp_{c_id}.patch"
-                        with open(patch_file, "w") as f:
-                            f.write(diff)
+                script_path = os.path.join(worktree_path, "candidate_script.py")
+                if not os.path.exists(script_path):
+                    with open(script_path, "w") as f:
+                        f.write("\n")
 
-                        import subprocess
-                        subprocess.run(["git", "apply", patch_file], check=True, capture_output=True)
-                        if os.path.exists(patch_file):
-                            os.remove(patch_file)
+                if diff.strip():
+                    if not validate_and_apply_patch(diff, cwd=worktree_path):
+                        raise RuntimeError(f"Patch failed to apply for candidate {c_id}")
 
-                    if os.path.exists("candidate_script.py"):
-                        with open("candidate_script.py", "r") as f:
-                            patched_code = f.read()
-                    else:
-                        patched_code = "\n"
-
-                    git_controller.commit_patch(f"Add candidate {c_id}")
-
-                    git_controller.repo.heads[git_controller.original_branch].checkout()
-
-                with open(script_path, "w") as f:
-                    f.write(patched_code)
+                git_controller.commit_patch(worktree_path, f"Add candidate {c_id}")
 
                 final_score = 0.0
                 all_metrics = {}
@@ -93,9 +80,9 @@ class ConcurrentScheduler:
 
                 with self.git_lock:
                     if success:
-                        git_controller.merge_and_push(branch_name)
+                        git_controller.merge(branch_name, worktree_path)
                     else:
-                        git_controller.rollback(branch_name)
+                        git_controller.rollback(branch_name, worktree_path)
 
                 candidate['success'] = success
                 candidate['final_score'] = final_score
@@ -107,21 +94,19 @@ class ConcurrentScheduler:
 
             except Exception as e:
                 with self.git_lock:
-                    if branch_name:
+                    if branch_name and worktree_path:
                         try:
                             active_branches = [h.name for h in git_controller.repo.heads]
                         except AttributeError:
                             active_branches = git_controller.repo.heads.keys()
                         if branch_name in active_branches:
-                            git_controller.rollback(branch_name)
+                            git_controller.rollback(branch_name, worktree_path)
                 candidate['success'] = False
                 candidate['failure_category'] = "runtime"
                 candidate['error_msg'] = str(e)
                 candidate['metrics'] = {}
                 candidate['total_execution_time'] = 0.0
                 return candidate
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = [executor.submit(process_candidate, c) for c in candidates]
