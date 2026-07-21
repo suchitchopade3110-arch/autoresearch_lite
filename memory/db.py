@@ -4,6 +4,7 @@ from chromadb.utils import embedding_functions
 from typing import List, Dict, Any, Optional
 import uuid
 import json
+from datetime import datetime, timezone
 
 class ExperimentDB:
     def __init__(self, db_path: str = "./chroma_db"):
@@ -46,7 +47,8 @@ class ExperimentDB:
             "rationale": rationale,
             "metrics": json.dumps(metrics),
             "outcome": outcome,
-            "failure_reason": failure_reason or ""
+            "failure_reason": failure_reason or "",
+            "created_at": datetime.now(timezone.utc).isoformat()
         }
 
         self.collection.add(
@@ -78,4 +80,20 @@ class ExperimentDB:
                     meta['distance'] = distances[i]
                 retrieved.append(meta)
 
+        return retrieved
+
+    def list_all_experiments(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """
+        Returns every stored experiment (no similarity search), for
+        aggregate KPI computation - retrieve_experiments is nearest-neighbor
+        search and isn't suited to "all of them."
+        """
+        results = self.collection.get(limit=limit)
+        retrieved = []
+        if results and results.get('metadatas'):
+            for metadata in results['metadatas']:
+                meta = dict(metadata)
+                meta['metrics'] = json.loads(meta['metrics'])
+                retrieved.append(meta)
+        retrieved.sort(key=lambda m: m.get('created_at', ''))
         return retrieved

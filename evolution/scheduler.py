@@ -1,8 +1,10 @@
 import concurrent.futures
 import os
 import threading
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
+from approval.gate import request_and_await_approval
+from approval.store import ApprovalStore
 from generation.patch_generator import validate_and_apply_patch
 
 
@@ -22,12 +24,20 @@ class ConcurrentScheduler:
                           sandbox,
                           evaluator,
                           metrics_calculator,
-                          failure_analyzer) -> List[Dict[str, Any]]:
+                          failure_analyzer,
+                          approval_store: Optional[ApprovalStore] = None,
+                          approval_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         results = []
+        # Fail safe: if the caller didn't wire a store, still gate merges
+        # rather than silently skipping approval - only an explicit, valid
+        # approval.enabled: false in approval_config actually disables it.
+        store = approval_store or ApprovalStore()
+        gate_config = approval_config or {}
 
         def process_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
             c_id = candidate['id']
             diff = candidate['diff']
+            goal = candidate.get('goal', 'Optimization goal')
 
             branch_name = None
             worktree_path = None
@@ -49,7 +59,7 @@ class ConcurrentScheduler:
 
                 final_score = 0.0
                 all_metrics = {}
-                success = True
+                eval_passed = True
                 failure_category = "success"
                 error_msg = ""
                 total_execution_time = 0.0
@@ -67,7 +77,7 @@ class ConcurrentScheduler:
                     stage_success, stage_score = evaluator.evaluate_stage(exec_result, subset, threshold)
 
                     if not stage_success:
-                        success = False
+                        eval_passed = False
                         final_score = stage_score
                         cat, msg = failure_analyzer(exec_result, False)
                         failure_category = cat
@@ -78,13 +88,29 @@ class ConcurrentScheduler:
                     final_score = stage_score
                     all_metrics = metrics_calculator(exec_result)
 
+                merged = False
+                approval_decision = None
+                if eval_passed:
+                    # Each candidate polls its own approval request - this
+                    # blocks only this worker thread, so sibling candidates
+                    # in the same generation are unaffected while it waits.
+                    approval_decision = request_and_await_approval(
+                        store, c_id, goal, diff, final_score, all_metrics, gate_config
+                    )
+
                 with self.git_lock:
-                    if success:
+                    if eval_passed and approval_decision in ("approved", "skipped"):
                         git_controller.merge(branch_name, worktree_path)
+                        merged = True
                     else:
                         git_controller.rollback(branch_name, worktree_path)
+                        if eval_passed:
+                            failure_category = "held"
+                            error_msg = f"approval_decision={approval_decision}"
 
-                candidate['success'] = success
+                candidate['success'] = merged
+                candidate['eval_passed'] = eval_passed
+                candidate['approval_decision'] = approval_decision
                 candidate['final_score'] = final_score
                 candidate['metrics'] = all_metrics
                 candidate['failure_category'] = failure_category
@@ -102,6 +128,8 @@ class ConcurrentScheduler:
                         if branch_name in active_branches:
                             git_controller.rollback(branch_name, worktree_path)
                 candidate['success'] = False
+                candidate['eval_passed'] = False
+                candidate['approval_decision'] = None
                 candidate['failure_category'] = "runtime"
                 candidate['error_msg'] = str(e)
                 candidate['metrics'] = {}

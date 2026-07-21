@@ -7,7 +7,7 @@ def test_full_loop_execution():
     # Create a temporary directory to act as the repository
     with tempfile.TemporaryDirectory() as temp_repo:
         # Copy the project files to the temp directory
-        for item in ["configs", "orchestrator", "eval", "sandbox", "vcs", "memory", "generation"]:
+        for item in ["configs", "orchestrator", "eval", "sandbox", "vcs", "memory", "generation", "approval", "reporting"]:
             shutil.copytree(item, os.path.join(temp_repo, item))
 
         # create gitignore
@@ -16,6 +16,17 @@ def test_full_loop_execution():
 
         with open(os.path.join(temp_repo, "candidate_script.py"), "w") as f:
             f.write("\n")
+
+        # This is an unattended/automated run with no dashboard operator, so
+        # explicitly declare that - the default config requires approval
+        # (fail-safe), which would otherwise leave every candidate held
+        # pending for the full timeout with nobody there to decide.
+        config_path = os.path.join(temp_repo, "configs", "example.yaml")
+        with open(config_path) as f:
+            config_text = f.read()
+        config_text = config_text.replace("  enabled: true", "  enabled: false")
+        with open(config_path, "w") as f:
+            f.write(config_text)
 
         # Initialize a new git repository
         subprocess.run(["git", "init"], cwd=temp_repo, check=True)

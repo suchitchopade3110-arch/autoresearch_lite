@@ -11,8 +11,9 @@ from evolution.scoring import score_candidates
 from evolution.reporting import log_generation_report
 
 class EvolutionEngine:
-    def __init__(self, config: Dict[str, Any], git_controller, sandbox, evaluator, metrics_calculator, failure_analyzer, patch_generator: PatchGenerator, prompt_builder: PromptBuilder, db: ExperimentDB):
+    def __init__(self, config: Dict[str, Any], git_controller, sandbox, evaluator, metrics_calculator, failure_analyzer, patch_generator: PatchGenerator, prompt_builder: PromptBuilder, db: ExperimentDB, approval_store=None):
         self.config = config.get('evolution', {})
+        self.full_config = config
         self.eval_config = config.get('eval', {})
         self.git_controller = git_controller
         self.sandbox = sandbox
@@ -22,6 +23,7 @@ class EvolutionEngine:
         self.patch_generator = patch_generator
         self.prompt_builder = prompt_builder
         self.db = db
+        self.approval_store = approval_store
 
         self.pop_size = self.config.get('population_size', 5)
         self.max_gens = self.config.get('max_generations', 3)
@@ -116,18 +118,27 @@ class EvolutionEngine:
                 self.sandbox,
                 self.evaluator,
                 self.metrics_calculator,
-                self.failure_analyzer
+                self.failure_analyzer,
+                approval_store=self.approval_store,
+                approval_config=self.full_config,
             )
 
             scored = score_candidates(evaluated, self.config)
 
             for c in scored:
+                if c['success']:
+                    outcome = "success"
+                elif c.get('eval_passed'):
+                    outcome = "held"  # passed evaluation but not approved for merge
+                else:
+                    outcome = "failure"
+
                 self.db.store_experiment(
                     hypothesis=goal,
                     diff=c['diff'],
                     rationale=f"Generation {gen} candidate",
                     metrics=c['metrics'],
-                    outcome="success" if c['success'] else "failure",
+                    outcome=outcome,
                     failure_reason=c.get('error_msg', None)
                 )
 

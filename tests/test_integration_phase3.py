@@ -5,7 +5,7 @@ import shutil
 
 def test_full_loop_phase3_evolution():
     with tempfile.TemporaryDirectory() as temp_repo:
-        for item in ["configs", "orchestrator", "eval", "sandbox", "vcs", "memory", "generation", "evolution"]:
+        for item in ["configs", "orchestrator", "eval", "sandbox", "vcs", "memory", "generation", "evolution", "approval", "reporting"]:
             shutil.copytree(item, os.path.join(temp_repo, item))
 
         with open(os.path.join(temp_repo, ".gitignore"), "w") as f:
@@ -25,6 +25,8 @@ def test_full_loop_phase3_evolution():
             config = f.read()
         config = config.replace("population_size: 5", "population_size: 2")
         config = config.replace("max_generations: 3", "max_generations: 2")
+        # Unattended run, no dashboard operator present - see test_integration.py
+        config = config.replace("  enabled: true", "  enabled: false")
         with open(config_path, "w") as f:
             f.write(config)
 

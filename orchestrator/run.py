@@ -18,6 +18,11 @@ from generation.prompt_builder import PromptBuilder
 from generation.patch_generator import PatchGenerator, MockLLMClient
 from generation.static_check import check_syntax
 
+# Phase 4 imports
+from approval.store import ApprovalStore
+from approval.gate import request_and_await_approval
+from reporting.report_generator import generate_report
+
 
 def main():
     parser = argparse.ArgumentParser(description="Run the core loop")
@@ -49,6 +54,12 @@ def main():
     llm_client = MockLLMClient()
     patch_generator = PatchGenerator(llm_client)
 
+    # Phase 4: human-approval gate. resolve_approval_config (inside the gate)
+    # defaults to "required" for any missing/malformed approval config - see
+    # approval/gate.py.
+    approval_store = ApprovalStore(config.get('approval', {}).get('db_path', 'approvals.db')
+                                    if isinstance(config.get('approval'), dict) else 'approvals.db')
+
     if args.mode == "evolutionary":
         from evolution.population import EvolutionEngine
         engine = EvolutionEngine(
@@ -60,9 +71,11 @@ def main():
             failure_analyzer=analyze_failure,
             patch_generator=patch_generator,
             prompt_builder=prompt_builder,
-            db=db
+            db=db,
+            approval_store=approval_store,
         )
         engine.run(args.goal)
+        generate_report(db, approval_store)
         sys.exit(0)
 
     eval_stages = config.get('eval', {}).get('stages', [])
@@ -118,7 +131,7 @@ def main():
 
         # 4. Execute in sandbox once per progressive-scaling stage, so each
         # stage's score reflects that stage's own dataset subset.
-        success = True
+        eval_passed = True
         final_score = 0.0
         metrics = {}
         execution_result = None
@@ -138,26 +151,17 @@ def main():
 
             stage_success, final_score = evaluator.evaluate_stage(execution_result, subset, threshold)
             if not stage_success:
-                success = False
+                eval_passed = False
                 break
 
-        if success:
+        if eval_passed:
             print("Candidate passed all evaluation stages.")
 
         # 5. Analyze failure and log to Memory
-        category, error_text = analyze_failure(execution_result, success)
+        category, error_text = analyze_failure(execution_result, eval_passed)
 
-        if success:
-            print(f"Candidate {candidate_id} succeeded with score {final_score:.4f}. Merging.")
-            db.store_experiment(
-                hypothesis=goal,
-                diff=diff,
-                rationale="Generated patch passed evaluation",
-                metrics=metrics,
-                outcome="success"
-            )
-            vcs.merge(branch_name, worktree_path)
-        else:
+        merged = False
+        if not eval_passed:
             print(f"Candidate {candidate_id} failed ({category}). Rolling back.")
             db.store_experiment(
                 hypothesis=goal,
@@ -168,9 +172,40 @@ def main():
                 failure_reason=error_text
             )
             vcs.rollback(branch_name, worktree_path)
+        else:
+            # 6. Human-approval gate - genuinely blocks the merge path.
+            # Only "approved" or "skipped" (gate explicitly disabled) may
+            # proceed to merge; "rejected" and "timed_out" roll back.
+            print(f"Candidate {candidate_id} passed evaluation with score {final_score:.4f}. Awaiting approval...")
+            decision = request_and_await_approval(
+                approval_store, candidate_id, goal, diff, final_score, metrics, config
+            )
+
+            if decision in ("approved", "skipped"):
+                print(f"Candidate {candidate_id} approved ({decision}). Merging.")
+                db.store_experiment(
+                    hypothesis=goal,
+                    diff=diff,
+                    rationale="Generated patch passed evaluation and approval",
+                    metrics=metrics,
+                    outcome="success"
+                )
+                vcs.merge(branch_name, worktree_path)
+                merged = True
+            else:
+                print(f"Candidate {candidate_id} was not merged (approval decision: {decision}). Rolling back.")
+                db.store_experiment(
+                    hypothesis=goal,
+                    diff=diff,
+                    rationale="Generated patch passed evaluation but was not approved",
+                    metrics=metrics,
+                    outcome="held",
+                    failure_reason=f"approval_decision={decision}"
+                )
+                vcs.rollback(branch_name, worktree_path)
 
         print(f"--- Finished iteration for candidate {candidate_id} ---\n")
-        return success, final_score
+        return merged, final_score
 
     max_iterations = args.max_iterations or orch_cfg.get('max_iterations', 1)
     target_score = args.target_score if args.target_score is not None else orch_cfg.get('target_score', 1.0)
@@ -198,6 +233,8 @@ def main():
         if iterations_since_improvement >= patience:
             print(f"No improvement in {patience} iterations. Stopping early.")
             break
+
+    generate_report(db, approval_store)
 
     if not any_success:
         sys.exit(1)
