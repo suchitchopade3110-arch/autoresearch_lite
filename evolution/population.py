@@ -26,6 +26,10 @@ class EvolutionEngine:
         self.pop_size = self.config.get('population_size', 5)
         self.max_gens = self.config.get('max_generations', 3)
         self.scheduler = ConcurrentScheduler(self.config.get('max_concurrent_sandboxes', 3))
+        # a dedicated instance, not the global random module, so selection is
+        # reproducible given the same seed without affecting anything else
+        # that happens to use `random` in-process.
+        self.rng = random.Random(self.config.get('random_seed', 42))
 
         self.best_scores = []
         self.duplicate_avoidance_count = 0
@@ -45,8 +49,8 @@ class EvolutionEngine:
             if not validate_and_apply_patch(diff, dry_run=True):
                 continue
 
-            dup_threshold = self.config.get('duplicate_threshold', 0.1)
-            if not is_duplicate(diff, self.db, dup_threshold):
+            dup_threshold = self.config.get('duplicate_threshold', 0.25)
+            if not is_duplicate(diff, self.db, dup_threshold, hypothesis=goal):
                 return {
                     'id': uuid.uuid4().hex[:8],
                     'diff': diff,
@@ -73,7 +77,7 @@ class EvolutionEngine:
             parents = []
             k = max(1, len(sorted_cands) // 2)
             for _ in range(k):
-                tournament = random.sample(sorted_cands, min(3, len(sorted_cands)))
+                tournament = self.rng.sample(sorted_cands, min(3, len(sorted_cands)))
                 best = max(tournament, key=lambda x: x.get('composite_score', -float('inf')))
                 parents.append(best)
             return parents
@@ -159,7 +163,7 @@ class EvolutionEngine:
                 next_generation.append(elite)
 
             while len(next_generation) < self.pop_size:
-                parent = random.choice(parents) if parents else None
+                parent = self.rng.choice(parents) if parents else None
                 mutation_context = f"Vary the approach used in diff:\n{parent['diff']}" if parent else ""
                 next_generation.append(self._generate_candidate(goal, mutation_context))
 

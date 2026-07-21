@@ -1,10 +1,18 @@
 from memory.db import ExperimentDB
 
-def is_duplicate(diff: str, db: ExperimentDB, threshold: float = 0.1) -> bool:
+def is_duplicate(diff: str, db: ExperimentDB, threshold: float = 0.25, hypothesis: str = "") -> bool:
     if not diff or diff.strip() == "":
         return False
 
-    results = db.retrieve_experiments(query=diff, k=1)
+    # Shape the query the same way store_experiment shapes its embedded
+    # document (Hypothesis + Diff) - querying with the bare diff against a
+    # document that also contains hypothesis/rationale/outcome text dilutes
+    # the comparison so much that even an exact-diff match scores no better
+    # than an unrelated one. Matching the shape (hypothesis included) brings
+    # near-duplicate diffs to a distinctly lower distance than unrelated ones.
+    query = f"Hypothesis: {hypothesis}\nDiff:\n{diff}" if hypothesis else diff
+
+    results = db.retrieve_experiments(query=query, k=1)
 
     if not results:
         return False
