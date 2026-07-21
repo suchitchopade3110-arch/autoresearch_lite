@@ -184,3 +184,32 @@ def test_mock_llm_diff_produces_a_real_dataset_driven_script():
         assert "SUBSET_PERCENTAGE" in content
         assert "SCORE:" in content
         assert "MOCK_SCORE" not in content
+        # Regression: the hunk header once declared fewer lines than it
+        # actually added (30 vs the real 34), which some git versions
+        # silently truncate to on apply rather than reject outright - the
+        # entry-point guard was exactly what got cut, so main() was defined
+        # but never called and the script produced no output at all.
+        assert 'if __name__ == "__main__":' in content
+        assert content.strip().endswith("main()")
+
+def test_mock_llm_diff_hunk_header_matches_actual_line_count():
+    """
+    Regression test for the bug above, at its actual root: a unified diff's
+    hunk header must declare the true number of added/removed lines. git on
+    Linux tolerated a wrong count in this hunk (30 declared vs 33 actual)
+    well enough that this went unnoticed for a long time; git on Windows
+    truncated the patch to the declared count instead of rejecting it.
+    Check the arithmetic directly so this can never silently regress again,
+    regardless of how lenient any particular git version happens to be.
+    """
+    diff = MockLLMClient().generate_diff("prompt", "candidate_script.py")
+    lines = diff.splitlines()
+    hunk_start = next(i for i, l in enumerate(lines) if l.startswith("@@"))
+    header = lines[hunk_start]
+    body = lines[hunk_start + 1:]  # excludes the "+++ b/..." file header, which also starts with "+"
+
+    declared_added = int(header.split("+1,")[1].split(" ")[0])
+    actual_added = sum(1 for l in body if l.startswith("+"))
+    assert declared_added == actual_added, (
+        f"hunk header declares {declared_added} added lines but diff actually has {actual_added}"
+    )

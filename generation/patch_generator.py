@@ -23,7 +23,7 @@ class MockLLMClient(LLMClient):
     def generate_diff(self, prompt: str, target_file: str) -> str:
         return f"""--- a/{target_file}
 +++ b/{target_file}
-@@ -1 +1,30 @@
+@@ -1 +1,33 @@
 -
 +import json
 +import os
