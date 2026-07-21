@@ -23,7 +23,7 @@ class MockLLMClient(LLMClient):
     def generate_diff(self, prompt: str, target_file: str) -> str:
         return f"""--- a/{target_file}
 +++ b/{target_file}
-@@ -1 +1,30 @@
+@@ -1 +1,33 @@
 -
 +import json
 +import os
@@ -76,7 +76,14 @@ def validate_and_apply_patch(diff_content: str, cwd: Optional[str] = None, dry_r
     """
     fd, patch_file = tempfile.mkstemp(suffix=".patch")
     try:
-        with os.fdopen(fd, "w") as f:
+        # newline='' disables Python's platform line-ending translation, so
+        # the diff's own '\n' bytes are written through unchanged. Without
+        # it, the default text mode on Windows rewrites every '\n' to
+        # '\r\n' - including inside the patch file's own hunk lines - which
+        # confuses git apply's line-based hunk parser and causes it to
+        # silently apply only part of the hunk (observed: the last two
+        # lines of a 30-line hunk went missing, with no error at all).
+        with os.fdopen(fd, "w", newline='') as f:
             f.write(diff_content)
 
         subprocess.run(["git", "apply", "--check", patch_file], check=True, capture_output=True, cwd=cwd)
