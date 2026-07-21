@@ -48,6 +48,13 @@ def score_candidates(candidates: List[Dict[str, Any]], config: Dict[str, Any]) -
         if 'energy_estimate' not in m and 'execution_time' in m:
             m['energy_estimate'] = m['execution_time'] * watts_constant
 
+        # final_score is the candidate's real progressive-eval result, set by
+        # the scheduler; without this, validation_accuracy always defaulted
+        # to 0.0 for every candidate, so selection ignored correctness
+        # entirely and ranked purely on execution_speed/energy_estimate.
+        if 'validation_accuracy' not in m and 'final_score' in c:
+            m['validation_accuracy'] = c['final_score']
+
         m.setdefault('validation_accuracy', 0.0)
         m.setdefault('execution_speed', 0.0)
         m.setdefault('memory_usage', 1024.0)
@@ -88,5 +95,23 @@ def score_candidates(candidates: List[Dict[str, Any]], config: Dict[str, Any]) -
 
     else:
         raise ValueError(f"Unknown scoring strategy: {strategy}")
+
+    # A candidate that failed evaluation must never outrank one that passed,
+    # under either strategy - without this, a candidate that crashed almost
+    # instantly (very low execution_time -> very high execution_speed / low
+    # energy_estimate) can out-score a real success on those axes alone,
+    # since execution_speed is unbounded while validation_accuracy is
+    # capped at 1.0. Shifting every failure's score down by the same amount
+    # preserves relative order within the successes and within the
+    # failures, and just guarantees the two groups never cross.
+    successful = [c['composite_score'] for c in candidates if c.get('success')]
+    failed = [c for c in candidates if not c.get('success')]
+    if successful and failed:
+        min_success = min(successful)
+        max_failure = max(c['composite_score'] for c in failed)
+        if max_failure >= min_success:
+            shift = (max_failure - min_success) + 1.0
+            for c in failed:
+                c['composite_score'] -= shift
 
     return candidates

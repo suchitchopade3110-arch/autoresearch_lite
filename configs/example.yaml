@@ -1,5 +1,5 @@
 sandbox:
-  timeout_seconds: 10
+  timeout_seconds: 5
   cpu_limit: "0.5"
   memory_limit: "256m"
 
@@ -30,9 +30,10 @@ evolution:
   population_size: 5
   max_generations: 3
   max_concurrent_sandboxes: 3
-  duplicate_threshold: 0.1
+  duplicate_threshold: 0.25
   selection_strategy: tournament
   scoring_strategy: pareto
+  random_seed: 42
 
 generation:
   max_retrieved_failures: 2
