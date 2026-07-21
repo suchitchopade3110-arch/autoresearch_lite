@@ -1,5 +1,6 @@
 import subprocess
 import os
+import sys
 import tempfile
 import shutil
 
@@ -34,9 +35,9 @@ def test_full_loop_phase2():
 
         # Run the loop in the temporary directory with a specific goal
         goal = "Test Phase 2 Mock"
-        cmd = ["python", "-m", "orchestrator.run", "--config", "configs/example.yaml", "--goal", goal]
+        # sys.executable, not a bare "python" - see test_integration.py
+        cmd = [sys.executable, "-m", "orchestrator.run", "--config", "configs/example.yaml", "--goal", goal]
 
-        # Use python from the current path but set cwd to temp_repo
         env = os.environ.copy()
         env["PYTHONPATH"] = temp_repo
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=temp_repo, env=env)
@@ -62,7 +63,7 @@ print("DB check passed")
         with open(os.path.join(temp_repo, "check_db.py"), "w") as f:
             f.write(check_db_script)
 
-        db_result = subprocess.run(["python", "check_db.py"], capture_output=True, text=True, cwd=temp_repo, env=env)
+        db_result = subprocess.run([sys.executable, "check_db.py"], capture_output=True, text=True, cwd=temp_repo, env=env)
         assert db_result.returncode == 0
         assert "DB check passed" in db_result.stdout
 
@@ -103,7 +104,7 @@ db.store_experiment(
 """
         with open(os.path.join(temp_repo, "inject.py"), "w") as f:
             f.write(inject_script)
-        subprocess.run(["python", "inject.py"], cwd=temp_repo, env=env, check=True)
+        subprocess.run([sys.executable, "inject.py"], cwd=temp_repo, env=env, check=True)
 
         # Now run a script that builds a prompt and verifies it contains the failure
         check_prompt_script = """
@@ -124,6 +125,6 @@ print("Prompt builder successfully included the past failure.")
         with open(os.path.join(temp_repo, "check_prompt.py"), "w") as f:
             f.write(check_prompt_script)
 
-        res = subprocess.run(["python", "check_prompt.py"], capture_output=True, text=True, cwd=temp_repo, env=env)
+        res = subprocess.run([sys.executable, "check_prompt.py"], capture_output=True, text=True, cwd=temp_repo, env=env)
         assert res.returncode == 0
         assert "Prompt builder successfully included the past failure" in res.stdout

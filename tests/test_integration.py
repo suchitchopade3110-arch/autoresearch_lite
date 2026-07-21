@@ -1,5 +1,6 @@
 import subprocess
 import os
+import sys
 import tempfile
 import shutil
 
@@ -35,10 +36,12 @@ def test_full_loop_execution():
         subprocess.run(["git", "add", "."], cwd=temp_repo, check=True)
         subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=temp_repo, check=True)
 
-        # Run the loop in the temporary directory
-        cmd = ["python", "-m", "orchestrator.run", "--config", "configs/example.yaml"]
+        # Run the loop in the temporary directory. Use sys.executable, not a
+        # bare "python" - on a machine with multiple Python installs, PATH
+        # can resolve "python" to a different interpreter than the one
+        # actually running this test (and therefore lack chromadb etc.).
+        cmd = [sys.executable, "-m", "orchestrator.run", "--config", "configs/example.yaml"]
 
-        # Use python from the current path but set cwd to temp_repo
         env = os.environ.copy()
         env["PYTHONPATH"] = temp_repo
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=temp_repo, env=env)
