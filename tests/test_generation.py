@@ -3,7 +3,7 @@ import os
 import tempfile
 import subprocess
 from generation.static_check import check_syntax
-from generation.patch_generator import validate_and_apply_patch
+from generation.patch_generator import MockLLMClient, validate_and_apply_patch
 
 def test_static_check_valid():
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
@@ -66,3 +66,93 @@ def test_validate_and_apply_patch_invalid():
             assert validate_and_apply_patch(diff) is False
         finally:
             os.chdir(cwd)
+
+def test_validate_and_apply_patch_with_explicit_cwd():
+    """The cwd param lets a patch be applied against a directory other than the process's own cwd."""
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=d, check=False)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=d, check=False)
+
+        diff = """--- /dev/null
++++ b/test.py
+@@ -0,0 +1,2 @@
++def foo():
++    pass
+"""
+        assert validate_and_apply_patch(diff, cwd=d) is True
+        assert os.path.exists(os.path.join(d, "test.py"))
+        # process cwd itself is untouched
+        assert not os.path.exists("test.py")
+
+def test_dry_run_validation_has_no_side_effects_and_is_repeatable():
+    """
+    Regression test: evolution/population.py validates every candidate's
+    diff before scheduling it, without a worktree of its own. That check
+    must never mutate the shared checkout - otherwise the first candidate's
+    successful validation permanently changes the file on disk, and every
+    later candidate (even with the identical diff) fails validation because
+    the file no longer matches the diff's expected original content.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=d, check=False)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=d, check=False)
+        with open(os.path.join(d, "candidate_script.py"), "w") as f:
+            f.write("\n")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=d, check=True)
+
+        diff = MockLLMClient().generate_diff("goal", "candidate_script.py")
+
+        for _ in range(3):
+            assert validate_and_apply_patch(diff, cwd=d, dry_run=True) is True
+
+        # file on disk must be untouched by repeated dry runs
+        with open(os.path.join(d, "candidate_script.py")) as f:
+            assert f.read() == "\n"
+
+def test_evolution_fallback_diff_is_a_valid_patch():
+    """Regression test: the fallback diff in EvolutionEngine._generate_candidate must actually apply."""
+    import uuid
+
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=d, check=False)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=d, check=False)
+        with open(os.path.join(d, "candidate_script.py"), "w") as f:
+            f.write("\n")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=d, check=True)
+
+        fallback_diff = f"--- a/candidate_script.py\n+++ b/candidate_script.py\n@@ -1 +1 @@\n-\n+print('Fallback {uuid.uuid4().hex[:4]}')\n"
+        assert validate_and_apply_patch(fallback_diff, cwd=d) is True
+
+def test_mock_llm_diff_produces_a_real_dataset_driven_script():
+    """
+    The mock diff replaces a blank placeholder file with a script that
+    reads DATASET_PATH/SUBSET_PERCENTAGE and prints a real SCORE - not a
+    hardcoded number - so the eval pipeline gets a genuine result to gate on.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=d, check=False)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=d, check=False)
+        with open(os.path.join(d, "candidate_script.py"), "w") as f:
+            f.write("\n")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=d, check=True)
+
+        diff = MockLLMClient().generate_diff("prompt", "candidate_script.py")
+        assert validate_and_apply_patch(diff, cwd=d) is True
+
+        script_path = os.path.join(d, "candidate_script.py")
+        success, msg = check_syntax(script_path)
+        assert success, msg
+
+        with open(script_path) as f:
+            content = f.read()
+        assert "DATASET_PATH" in content
+        assert "SUBSET_PERCENTAGE" in content
+        assert "SCORE:" in content
+        assert "MOCK_SCORE" not in content

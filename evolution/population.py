@@ -39,7 +39,10 @@ class EvolutionEngine:
 
             diff = self.patch_generator.llm_client.generate_diff(prompt, "candidate_script.py")
 
-            if not validate_and_apply_patch(diff):
+            # dry_run: only check applicability here, don't mutate the
+            # shared checkout - the scheduler applies it for real, once,
+            # inside the candidate's own worktree.
+            if not validate_and_apply_patch(diff, dry_run=True):
                 continue
 
             dup_threshold = self.config.get('duplicate_threshold', 0.1)
@@ -54,7 +57,7 @@ class EvolutionEngine:
 
         return {
             'id': uuid.uuid4().hex[:8],
-            'diff': f"--- a/candidate_script.py\n+++ b/candidate_script.py\n@@ -1 +1,2 @@\n- \n+print('Fallback {uuid.uuid4().hex[:4]}')",
+            'diff': f"--- a/candidate_script.py\n+++ b/candidate_script.py\n@@ -1 +1 @@\n-\n+print('Fallback {uuid.uuid4().hex[:4]}')\n",
             'goal': goal
         }
 

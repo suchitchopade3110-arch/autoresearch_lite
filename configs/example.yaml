@@ -4,7 +4,9 @@ sandbox:
   memory_limit: "256m"
 
 dataset:
-  path: "dummy_data/"
+  path: "dummy_data/dataset.jsonl"
+  size: 1000
+  seed: 42
 
 eval:
   stages:
@@ -16,3 +18,23 @@ eval:
       threshold: 0.7
     - subset_percentage: 100
       threshold: 0.8
+
+# Sequential mode only (--mode sequential, the default)
+orchestrator:
+  max_iterations: 1
+  target_score: 1.0
+  patience: 1
+
+# Evolutionary mode only (--mode evolutionary)
+evolution:
+  population_size: 5
+  max_generations: 3
+  max_concurrent_sandboxes: 3
+  duplicate_threshold: 0.1
+  selection_strategy: tournament
+  scoring_strategy: pareto
+
+generation:
+  max_retrieved_failures: 2
+  max_retrieved_successes: 2
+  prompt_char_budget: 4000

@@ -1,2 +1,5 @@
 __pycache__/
 chroma_db/
+dummy_data/
+.candidate_worktrees/
+evolution_report.jsonl
