@@ -11,12 +11,16 @@ from vcs.git_controller import GitController
 def repo_dir():
     with tempfile.TemporaryDirectory() as d:
         repo = git.Repo.init(d)
-
-        test_file = os.path.join(d, "test.txt")
-        with open(test_file, "w") as f:
-            f.write("initial state")
-        repo.index.add(["test.txt"])
-        repo.index.commit("initial commit")
+        try:
+            test_file = os.path.join(d, "test.txt")
+            with open(test_file, "w") as f:
+                f.write("initial state")
+            repo.index.add(["test.txt"])
+            repo.index.commit("initial commit")
+        finally:
+            # Windows keeps the tempdir locked while this handle is open,
+            # which would fail the TemporaryDirectory cleanup below.
+            repo.close()
 
         yield d
 
@@ -30,7 +34,12 @@ def test_create_branch_does_not_touch_main_worktree(repo_dir):
     # main working tree stays checked out on the original branch throughout
     assert controller.repo.active_branch.name == original_branch
     assert os.path.isdir(worktree_path)
-    assert git.Repo(worktree_path).active_branch.name == branch_name
+
+    wt_repo = git.Repo(worktree_path)
+    try:
+        assert wt_repo.active_branch.name == branch_name
+    finally:
+        wt_repo.close()
 
 
 def test_git_controller_rollback(repo_dir):

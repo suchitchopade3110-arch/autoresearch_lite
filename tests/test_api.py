@@ -1,27 +1,24 @@
-import importlib
 import os
 import sys
-import tempfile
 
 import pytest
 
 
 @pytest.fixture
-def client():
-    with tempfile.TemporaryDirectory() as d:
-        os.environ["CHROMA_DB_PATH"] = os.path.join(d, "chroma")
-        os.environ["APPROVAL_DB_PATH"] = os.path.join(d, "approvals.db")
-        os.environ["EVOLUTION_REPORT_PATH"] = os.path.join(d, "evolution_report.jsonl")
+def client(tmp_dir):
+    os.environ["CHROMA_DB_PATH"] = os.path.join(tmp_dir, "chroma")
+    os.environ["APPROVAL_DB_PATH"] = os.path.join(tmp_dir, "approvals.db")
+    os.environ["EVOLUTION_REPORT_PATH"] = os.path.join(tmp_dir, "evolution_report.jsonl")
 
-        # api.main builds its db/store at import time from those env vars,
-        # so force a fresh import per test rather than reusing a cached module.
-        for mod in ("api.main",):
-            if mod in sys.modules:
-                del sys.modules[mod]
-        import api.main as api_main
-        from fastapi.testclient import TestClient
+    # api.main builds its db/store at import time from those env vars,
+    # so force a fresh import per test rather than reusing a cached module.
+    for mod in ("api.main",):
+        if mod in sys.modules:
+            del sys.modules[mod]
+    import api.main as api_main
+    from fastapi.testclient import TestClient
 
-        yield TestClient(api_main.app), api_main.db, api_main.store
+    yield TestClient(api_main.app), api_main.db, api_main.store
 
 
 def test_dashboard_renders_pending_and_history(client):
