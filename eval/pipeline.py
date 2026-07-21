@@ -7,6 +7,20 @@ class EvalPipeline:
         self.dataset_path = config.get('path', 'dummy_data/')
         self.correlation_log: List[Tuple[float, float]] = []
 
+    def evaluate_stage(self, execution_result: Dict[str, Any], subset_percentage: int, threshold: float) -> Tuple[bool, float]:
+        """Evaluates a single stage. Returns (success, score)."""
+        if execution_result['exit_code'] != 0 or execution_result.get('timeout', False):
+            return False, 0.0
+
+        score = self._mock_score(subset_percentage, execution_result)
+        success = score >= threshold
+
+        print(f"Stage {subset_percentage}%: Score={score:.2f}, Threshold={threshold}")
+        if not success:
+            print(f"Candidate failed at {subset_percentage}% subset.")
+
+        return success, score
+
     def evaluate(self, execution_result: Dict[str, Any]) -> Tuple[bool, float]:
         """
         Evaluates the candidate using progressive scaling.
@@ -20,16 +34,10 @@ class EvalPipeline:
             subset = stage['subset_percentage']
             threshold = stage['threshold']
 
-            # Dummy evaluation logic
-            # In a real system, this would load `self.dataset_path`, subset it to `subset`%,
-            # and run the candidate model. Here we just mock a score based on stdout or random.
-            score = self._mock_score(subset, execution_result)
+            success, score = self.evaluate_stage(execution_result, subset, threshold)
             stage_scores[subset] = score
 
-            print(f"Stage {subset}%: Score={score:.2f}, Threshold={threshold}")
-
-            if score < threshold:
-                print(f"Candidate failed at {subset}% subset.")
+            if not success:
                 return False, score
 
         # If we passed all stages, track correlation between 1% and 100% stages

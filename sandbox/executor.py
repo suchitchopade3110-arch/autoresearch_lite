@@ -26,17 +26,9 @@ class SandboxExecutor:
             capture_output=True
         )
 
-    def run_candidate(self, script_path: str) -> Dict[str, Any]:
+    def run_candidate(self, script_path: str, env_vars: Dict[str, str] = None) -> Dict[str, Any]:
         """Runs the given script inside the docker sandbox."""
         start_time = time.time()
-
-        cmd = [
-            "docker", "run", "--rm",
-            f"--cpus={self.cpu_limit}",
-            f"--memory={self.memory_limit}",
-            "-v", f"{script_path}:/app/candidate_script.py:ro",
-            "ml-sandbox"
-        ]
 
         import uuid
         container_name = f"sandbox-{uuid.uuid4().hex[:8]}"
@@ -45,9 +37,16 @@ class SandboxExecutor:
             f"--name={container_name}",
             f"--cpus={self.cpu_limit}",
             f"--memory={self.memory_limit}",
+        ]
+
+        if env_vars:
+            for k, v in env_vars.items():
+                cmd.extend(["-e", f"{k}={v}"])
+
+        cmd.extend([
             "-v", f"{script_path}:/app/candidate_script.py:ro",
             "ml-sandbox"
-        ]
+        ])
 
         try:
             result = subprocess.run(

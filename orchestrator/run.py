@@ -19,8 +19,8 @@ from generation.static_check import check_syntax
 def main():
     parser = argparse.ArgumentParser(description="Run the core loop")
     parser.add_argument("--config", required=True, help="Path to config file")
-    # For Phase 2, we could specify the target file or goal via CLI, but hardcode for now
     parser.add_argument("--goal", default="Improve the mock candidate script performance", help="The research goal")
+    parser.add_argument("--mode", default="sequential", choices=["sequential", "evolutionary"], help="Mode to run the orchestrator in")
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -36,6 +36,22 @@ def main():
     prompt_builder = PromptBuilder(db, config.get('generation', {}))
     llm_client = MockLLMClient()
     patch_generator = PatchGenerator(llm_client)
+
+    if args.mode == "evolutionary":
+        from evolution.population import EvolutionEngine
+        engine = EvolutionEngine(
+            config=config,
+            git_controller=vcs,
+            sandbox=sandbox,
+            evaluator=evaluator,
+            metrics_calculator=calculate_all_metrics,
+            failure_analyzer=analyze_failure,
+            patch_generator=patch_generator,
+            prompt_builder=prompt_builder,
+            db=db
+        )
+        engine.run(args.goal)
+        sys.exit(0)
 
     def run_iteration(candidate_id: str, goal: str):
         print(f"--- Starting iteration for candidate {candidate_id} ---")
