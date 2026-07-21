@@ -1,5 +1,5 @@
 sandbox:
-  timeout_seconds: 5
+  timeout_seconds: 10
   cpu_limit: "0.5"
   memory_limit: "256m"
 

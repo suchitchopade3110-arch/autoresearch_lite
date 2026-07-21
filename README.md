@@ -1,16 +1,20 @@
-# ML Research Agent - Phase 1
+# ML Research Agent - Phase 2
 
-This repository contains Phase 1 ("The Core Loop & Sandbox") of an autonomous ML research agent.
+This repository contains Phase 2 ("RAG Memory & Patch Generation") of an autonomous ML research agent, built on top of the Phase 1 core loop.
 
-## What is implemented in Phase 1
+## What is implemented in Phase 2
 - **Orchestrator:** The core loop that proposes a candidate, runs it in a sandbox, evaluates it, and merges or rolls back based on results.
 - **Git State Controller:** A version control wrapper that manages branches, commits, merges, and hard rollbacks.
 - **Execution Sandbox:** A Docker-based sandbox to execute candidates safely.
 - **Proxy Dataset Pipeline:** A mock evaluation pipeline that uses progressive scaling (1% -> 5% -> 20% -> 100%) to gate evaluations.
+- **Experiment Memory (RAG):** Uses a local ChromaDB instance to store and retrieve hypotheses, patches, outcomes, and rationales for each experiment iteration.
+- **Failure Analysis:** Extracts structured failure records from runtime errors, syntax errors, and metric regressions.
+- **Prompt Builder:** Retrieves past successes and failures from memory to construct context-aware instructions.
+- **Patch Generation:** Deterministically generates and validates `unified diff` patches (`MockLLMClient` currently implements this).
+- **Static Analysis Pre-check:** Rejects malformed or invalid syntax code changes prior to sandbox execution.
 
 ## What is NOT implemented yet (Deferred to Later Phases)
-- **LLM-Based Code Generation:** The `generate_candidate()` function is currently a stub that returns a mock script. Code generation using LLMs is slated for Phase 2.
-- **RAG Memory / Context:** Fetching previous results or papers is not yet implemented.
+- **Real LLM Integration:** `MockLLMClient` returns a predefined template patch. Swap in a real model in `generation/patch_generator.py` (e.g. OpenAI/Anthropic SDKs).
 - **Evolutionary Search:** The current orchestrator runs a sequential, single-candidate loop. Multi-objective ranking or genetic search is out of scope.
 - **Dashboard/UI:** The system outputs to CLI only.
 
@@ -22,36 +26,24 @@ The execution sandbox uses standard Docker limits (`--cpus` and `--memory`) and 
 ### Prerequisites
 - Docker must be installed and running.
 - Python 3.9+
-- Packages: `pip install -r requirements.txt` (or install manually: `GitPython`, `PyYAML`, `pytest`)
+- Packages: `pip install -r requirements.txt` (or install manually: `GitPython`, `PyYAML`, `pytest`, `chromadb`, `pydantic`)
 
 ### Run the Core Loop
 Execute a single dummy loop iteration:
 
 ```bash
-python -m orchestrator.run --config configs/example.yaml
+python -m orchestrator.run --config configs/example.yaml --goal "Improve model performance"
 ```
 
-### Config Schema (`configs/example.yaml`)
+### Swapping in a real LLM
 
-```yaml
-sandbox:
-  timeout_seconds: 5         # Maximum wall-clock time for the candidate
-  cpu_limit: "0.5"           # Docker CPU limit
-  memory_limit: "256m"       # Docker memory limit
+Update `generation/patch_generator.py` and implement the `LLMClient` interface:
 
-dataset:
-  path: "dummy_data/"        # Path to the dataset (unused in Phase 1 stub)
-
-eval:
-  stages:                    # Progressive scaling stages
-    - subset_percentage: 1
-      threshold: 0.5
-    - subset_percentage: 5
-      threshold: 0.6
-    - subset_percentage: 20
-      threshold: 0.7
-    - subset_percentage: 100
-      threshold: 0.8
+```python
+class MyRealLLMClient(LLMClient):
+    def generate_diff(self, prompt: str, target_file: str) -> str:
+        # Call your API here and return the string unified diff
+        return api.call(prompt)
 ```
 
 ## Running Tests

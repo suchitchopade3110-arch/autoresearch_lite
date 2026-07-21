@@ -7,8 +7,15 @@ def test_full_loop_execution():
     # Create a temporary directory to act as the repository
     with tempfile.TemporaryDirectory() as temp_repo:
         # Copy the project files to the temp directory
-        for item in ["configs", "orchestrator", "eval", "sandbox", "vcs"]:
+        for item in ["configs", "orchestrator", "eval", "sandbox", "vcs", "memory", "generation"]:
             shutil.copytree(item, os.path.join(temp_repo, item))
+
+        # create gitignore
+        with open(os.path.join(temp_repo, ".gitignore"), "w") as f:
+            f.write("chroma_db/\n__pycache__/\n")
+
+        with open(os.path.join(temp_repo, "candidate_script.py"), "w") as f:
+            f.write("\n")
 
         # Initialize a new git repository
         subprocess.run(["git", "init"], cwd=temp_repo, check=True)

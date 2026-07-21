@@ -7,12 +7,20 @@ import sys
 from vcs.git_controller import GitController
 from sandbox.executor import SandboxExecutor
 from eval.pipeline import EvalPipeline
-from orchestrator.candidate import generate_candidate
 from orchestrator.metrics import calculate_all_metrics
+
+# Phase 2 imports
+from memory.db import ExperimentDB
+from memory.failure_analysis import analyze_failure
+from generation.prompt_builder import PromptBuilder
+from generation.patch_generator import PatchGenerator, MockLLMClient
+from generation.static_check import check_syntax
 
 def main():
     parser = argparse.ArgumentParser(description="Run the core loop")
     parser.add_argument("--config", required=True, help="Path to config file")
+    parser.add_argument("--goal", default="Improve the mock candidate script performance", help="The research goal")
+    parser.add_argument("--mode", default="sequential", choices=["sequential", "evolutionary"], help="Mode to run the orchestrator in")
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -23,29 +31,77 @@ def main():
     sandbox = SandboxExecutor(config.get('sandbox', {}))
     evaluator = EvalPipeline(config.get('eval', {}))
 
-    # Core loop skeleton: propose candidate -> execute -> evaluate -> record result
+    # Initialize Phase 2 components
+    db = ExperimentDB()
+    prompt_builder = PromptBuilder(db, config.get('generation', {}))
+    llm_client = MockLLMClient()
+    patch_generator = PatchGenerator(llm_client)
 
-    # State scoping using closure-like structure for the iteration
-    def run_iteration(candidate_id: str):
+    if args.mode == "evolutionary":
+        from evolution.population import EvolutionEngine
+        engine = EvolutionEngine(
+            config=config,
+            git_controller=vcs,
+            sandbox=sandbox,
+            evaluator=evaluator,
+            metrics_calculator=calculate_all_metrics,
+            failure_analyzer=analyze_failure,
+            patch_generator=patch_generator,
+            prompt_builder=prompt_builder,
+            db=db
+        )
+        engine.run(args.goal)
+        sys.exit(0)
+
+    def run_iteration(candidate_id: str, goal: str):
         print(f"--- Starting iteration for candidate {candidate_id} ---")
 
-        # 1. Propose candidate
-        script_code = generate_candidate()
-
-        # 2. VCS Branching
+        # 1. VCS Branching (do this first so patch application hits the branch)
         branch_name = vcs.create_branch(candidate_id)
         print(f"Created branch {branch_name}")
 
-        # Apply patch to disk
         script_path = "candidate_script.py"
-        with open(script_path, "w") as f:
-            f.write(script_code)
+
+        # 2. Phase 2 Generation
+        print("Building prompt...")
+        prompt = prompt_builder.build_prompt(goal)
+
+        print("Generating and applying patch...")
+        apply_success, diff = patch_generator.generate_and_apply(prompt, script_path)
+
+        if not apply_success:
+            print("Patch application failed (malformed diff). Rejecting candidate.")
+            db.store_experiment(
+                hypothesis=goal,
+                diff=diff,
+                rationale="Prompt generated malformed diff",
+                metrics={},
+                outcome="failure",
+                failure_reason="Malformed diff rejected by git apply."
+            )
+            vcs.rollback(branch_name)
+            return False
 
         vcs.commit_patch(f"Add candidate {candidate_id}")
 
-        # 3. Execute in Sandbox
+        # 3. Static Analysis Pre-check
+        print("Running static analysis...")
+        syntax_ok, syntax_err = check_syntax(script_path)
+        if not syntax_ok:
+            print(f"Static check failed: {syntax_err}")
+            db.store_experiment(
+                hypothesis=goal,
+                diff=diff,
+                rationale="Prompt generated syntax error",
+                metrics={},
+                outcome="failure",
+                failure_reason=syntax_err
+            )
+            vcs.rollback(branch_name)
+            return False
+
+        # 4. Execute in Sandbox
         print("Running in sandbox...")
-        # Resolve absolute path for volume mount
         abs_script_path = os.path.abspath(script_path)
         execution_result = sandbox.run_candidate(abs_script_path)
 
@@ -53,31 +109,42 @@ def main():
         if execution_result['timeout']:
             print("Execution TIMED OUT")
 
-        # Optional: calculate plugin metrics
         metrics = calculate_all_metrics(execution_result)
         print(f"Plugin Metrics: {metrics}")
 
-        # 4. Evaluate Proxy Data
+        # 5. Evaluate Proxy Data
         success, final_score = evaluator.evaluate(execution_result)
 
-        # 5. VCS Rollback or Merge
+        # 6. Analyze failure and log to Memory
+        category, error_text = analyze_failure(execution_result, success)
+
         if success:
             print(f"Candidate {candidate_id} succeeded with score {final_score:.2f}. Merging.")
+            db.store_experiment(
+                hypothesis=goal,
+                diff=diff,
+                rationale="Generated patch passed evaluation",
+                metrics=metrics,
+                outcome="success"
+            )
             vcs.merge_and_push(branch_name)
         else:
-            print(f"Candidate {candidate_id} failed. Rolling back.")
+            print(f"Candidate {candidate_id} failed ({category}). Rolling back.")
+            db.store_experiment(
+                hypothesis=goal,
+                diff=diff,
+                rationale="Generated patch failed",
+                metrics=metrics,
+                outcome="failure",
+                failure_reason=error_text
+            )
             vcs.rollback(branch_name)
-
-        # Clean up untracked script if it exists
-        if os.path.exists(script_path):
-            os.remove(script_path)
 
         print(f"--- Finished iteration for candidate {candidate_id} ---\n")
         return success
 
-    # Just running one dummy loop iteration for this phase
     candidate_id = uuid.uuid4().hex[:8]
-    success = run_iteration(candidate_id)
+    success = run_iteration(candidate_id, args.goal)
 
     if not success:
         sys.exit(1)
