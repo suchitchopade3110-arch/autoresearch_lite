@@ -1,13 +1,9 @@
 import pytest
-import os
-import tempfile
 from memory.db import ExperimentDB
 
 @pytest.fixture
-def test_db():
-    with tempfile.TemporaryDirectory() as d:
-        db = ExperimentDB(db_path=d)
-        yield db
+def test_db(tmp_dir):
+    yield ExperimentDB(db_path=tmp_dir)
 
 def test_db_roundtrip(test_db):
     rec_id = test_db.store_experiment(

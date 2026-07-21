@@ -30,12 +30,20 @@ class GitController:
     def commit_patch(self, worktree_path: str, message: str = "Apply candidate patch") -> bool:
         """Commits all current changes within the candidate's worktree."""
         wt_repo = git.Repo(worktree_path)
-        if not wt_repo.is_dirty(untracked_files=True):
-            return False
+        try:
+            if not wt_repo.is_dirty(untracked_files=True):
+                return False
 
-        wt_repo.git.add(A=True)
-        wt_repo.index.commit(message)
-        return True
+            wt_repo.git.add(A=True)
+            wt_repo.index.commit(message)
+            return True
+        finally:
+            # Windows keeps a file lock on the worktree while this handle is
+            # open, so a later `git worktree remove --force` on this same
+            # path (in rollback/merge) fails with "Permission denied" unless
+            # this is explicitly released first - Linux/macOS never enforce
+            # that, which is why this only shows up on Windows.
+            wt_repo.close()
 
     def rollback(self, branch_name: str, worktree_path: str) -> None:
         """Discards the candidate's worktree and deletes its branch. Never touches the main working tree."""
