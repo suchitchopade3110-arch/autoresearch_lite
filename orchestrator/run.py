@@ -109,7 +109,7 @@ def main():
                 failure_reason="Malformed diff rejected by git apply."
             )
             vcs.rollback(branch_name, worktree_path)
-            return False
+            return False, 0.0
 
         vcs.commit_patch(worktree_path, f"Add candidate {candidate_id}")
 
@@ -127,7 +127,7 @@ def main():
                 failure_reason=syntax_err
             )
             vcs.rollback(branch_name, worktree_path)
-            return False
+            return False, 0.0
 
         # 4. Execute in sandbox once per progressive-scaling stage, so each
         # stage's score reflects that stage's own dataset subset.
