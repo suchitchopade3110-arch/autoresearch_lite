@@ -5,6 +5,8 @@ import sys
 
 from eval.pipeline import EvalPipeline
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 CONFIG = {"stages": [{"subset_percentage": 100, "threshold": 0.5}]}
 
 # The entire "solution" is a printed claim - no prediction file, no attempt
@@ -36,3 +38,47 @@ def test_printed_score_claim_is_never_trusted(tmp_dir):
 
     assert score == 0.0
     assert reason  # a real reason string, not silent 0.0
+
+
+def test_partial_prediction_coverage_gets_no_partial_credit(tmp_dir):
+    """A candidate that only predicts for half the test ids scores 0.0, not 50%."""
+    truth = {"0": 1, "1": 0, "2": 1, "3": 0}
+    pred_path = os.path.join(tmp_dir, "predictions.jsonl")
+    with open(pred_path, "w") as f:
+        f.write(json.dumps({"id": 0, "pred": 1}) + "\n")
+        f.write(json.dumps({"id": 1, "pred": 0}) + "\n")
+
+    pipeline = EvalPipeline({"stages": []})
+    score, reason = pipeline.score_predictions(pred_path, truth)
+    assert score == 0.0
+    assert reason
+
+
+def test_truth_json_never_referenced_by_the_sandbox_executor():
+    """
+    Permanent regression test - must never be deleted or skipped. The
+    sandbox executor builds every `docker run -v ...` mount argument; if it
+    never mentions the held-out labels file by name, it is structurally
+    incapable of mounting it into a candidate's container.
+    """
+    executor_path = os.path.join(REPO_ROOT, "sandbox", "executor.py")
+    with open(executor_path) as f:
+        content = f.read()
+    assert "truth" not in content.lower()
+
+
+def test_truth_json_absent_from_every_docker_mount_argument_repo_wide():
+    """Belt-and-suspenders sweep: grep the whole repo (excluding this test itself) for truth.json near a mount/docker construct."""
+    result = subprocess.run(
+        ["grep", "-rn", "truth.json",
+         "--include=*.py",
+         "--exclude=test_reward_hacking.py",
+         "--exclude=test_sandbox.py",  # asserts truth.json is NOT visible in-container - a legitimate reference
+         REPO_ROOT],
+        capture_output=True, text=True,
+    )
+    offending = [
+        line for line in result.stdout.splitlines()
+        if "-v" in line or "docker" in line.lower() or "/app/" in line
+    ]
+    assert offending == [], "truth.json appears near a mount/docker construct:\n" + "\n".join(offending)
