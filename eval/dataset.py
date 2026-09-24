@@ -128,3 +128,25 @@ def load_subset(path: str, percentage: float, seed: int = DEFAULT_SEED) -> List[
     rows = load_dataset(path)
     idx = subset_indices(len(rows), percentage, seed)
     return [rows[i] for i in idx]
+
+
+def write_subset(src_path: str, dst_path: str, percentage: float, seed: int = DEFAULT_SEED) -> str:
+    """
+    Writes a HOST-SELECTED subset of src_path's rows to dst_path, so
+    mounting dst_path (instead of the full file) into the sandbox enforces
+    progressive scaling for real. Without this, SUBSET_PERCENTAGE is only
+    an environment variable handed to the candidate - honor-system only,
+    since sandbox/executor.py always mounted the full train.jsonl at every
+    stage regardless of what a candidate's own code did with that env var.
+    A candidate that ignores it now physically cannot see more than its
+    stage's allotted rows, because the rest were never written to the file
+    it can read in the first place. Returns dst_path.
+    """
+    rows = load_subset(src_path, percentage, seed)
+    parent = os.path.dirname(dst_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(dst_path, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    return dst_path

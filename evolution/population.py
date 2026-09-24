@@ -13,7 +13,7 @@ from evolution.reporting import log_generation_report
 from observability.logging_config import bind, get_logger
 
 class EvolutionEngine:
-    def __init__(self, config: Dict[str, Any], git_controller, sandbox, evaluator, metrics_calculator, failure_analyzer, patch_generator: PatchGenerator, prompt_builder: PromptBuilder, db: ExperimentDB, approval_store=None, truth=None, baseline_store=None, run_id=None):
+    def __init__(self, config: Dict[str, Any], git_controller, sandbox, evaluator, metrics_calculator, failure_analyzer, patch_generator: PatchGenerator, prompt_builder: PromptBuilder, db: ExperimentDB, approval_store=None, truth=None, baseline_store=None, run_id=None, train_path=None):
         self.config = config.get('evolution', {})
         self.full_config = config
         self.eval_config = config.get('eval', {})
@@ -28,6 +28,10 @@ class EvolutionEngine:
         self.approval_store = approval_store
         self.truth = truth or {}
         self.baseline_store = baseline_store
+        # The full training file - a HOST-SELECTED subset of it (not just
+        # the SUBSET_PERCENTAGE env var) is mounted per stage by the
+        # scheduler when this is set. See eval/dataset.py:write_subset.
+        self.train_path = train_path
         self.run_id = run_id or uuid.uuid4().hex[:12]
         self.logger = get_logger(__name__, run_id=self.run_id)
 
@@ -125,6 +129,59 @@ class EvolutionEngine:
             self.generation_failed_count += 1
         return None
 
+    def _carry_over_elite(self, goal: str, parent: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Re-includes the best candidate from the previous generation
+        unmodified, so a strong solution isn't lost to mutation/selection
+        noise even if every mutated sibling regresses. Two things a naive
+        "just copy the diff into next_generation" version gets wrong (see
+        the council audit):
+
+          1. If the parent actually merged, its change is now already part
+             of the current base - re-applying the SAME diff on top of
+             that base is, at best, a pointless no-op and at worst a hard
+             apply failure (the diff's removed-line context no longer
+             matches what's there), wasting a full sandbox slot on a
+             candidate that was never going to produce anything new. A
+             merged parent is never carried over.
+          2. The apply is dry-run-checked against a FRESH worktree based
+             on the CURRENT base (not whatever base the parent was
+             originally generated against) and duplicate-checked before
+             being handed to the scheduler - exactly like a freshly
+             generated candidate, not silently exempt from either check.
+
+        Returns None (rolling back any worktree it created) if the parent
+        merged, is a duplicate of something already in memory, or its diff
+        no longer applies cleanly to the current base - the caller then
+        fills that population slot via ordinary generation instead.
+        """
+        if parent.get('success'):
+            return None
+
+        dup_threshold = self.config.get('duplicate_threshold', 0.25)
+        if is_duplicate(parent['diff'], self.db, dup_threshold, hypothesis=goal):
+            return None
+
+        candidate_id = uuid.uuid4().hex[:8]
+        candidate_logger = bind(self.logger, candidate_id=candidate_id)
+        branch_name, worktree_path = self.git_controller.create_branch(candidate_id)
+
+        error_out: List[str] = []
+        if not validate_and_apply_patch(
+            parent['diff'], cwd=worktree_path, dry_run=True, logger=candidate_logger, error_out=error_out,
+            allowed_files=["candidate_script.py"],
+        ):
+            self.git_controller.rollback(branch_name, worktree_path)
+            return None
+
+        return {
+            'id': candidate_id,
+            'diff': parent['diff'],
+            'goal': goal,
+            'branch_name': branch_name,
+            'worktree_path': worktree_path,
+        }
+
     def _select_parents(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         strategy = self.config.get('selection_strategy', 'tournament')
 
@@ -219,6 +276,7 @@ class EvolutionEngine:
                 approval_config=self.full_config,
                 truth=self.truth,
                 baseline_store=self.baseline_store,
+                train_path=self.train_path,
             )
 
             scored = score_candidates(evaluated, self.config)
@@ -272,16 +330,9 @@ class EvolutionEngine:
             next_generation = []
 
             if parents:
-                # Explicit reconstruction, not dict(parents[0]) - the parent's
-                # branch_name/worktree_path were already merged or rolled
-                # back by the scheduler, so this elite copy (a new id) must
-                # get a fresh worktree from _generate_candidate's sibling
-                # path, not try to reuse a worktree that no longer exists.
-                next_generation.append({
-                    'id': uuid.uuid4().hex[:8],
-                    'diff': parents[0]['diff'],
-                    'goal': parents[0]['goal'],
-                })
+                elite = self._carry_over_elite(goal, parents[0])
+                if elite is not None:
+                    next_generation.append(elite)
 
             next_generation.extend(
                 self._generate_population(goal, self.pop_size - len(next_generation), mutation_source=parents)

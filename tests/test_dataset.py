@@ -1,7 +1,7 @@
 import os
 import tempfile
 
-from eval.dataset import generate_split, load_dataset, load_subset, load_truth
+from eval.dataset import generate_split, load_dataset, load_subset, load_truth, write_subset
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -52,6 +52,29 @@ def test_subsets_are_nested():
         small_keys = {(r["x1"], r["x2"]) for r in small}
         big_keys = {(r["x1"], r["x2"]) for r in big}
         assert small_keys.issubset(big_keys)
+
+
+def test_write_subset_writes_only_the_host_selected_rows():
+    """
+    Council audit finding: progressive-scaling stages used to mount the
+    FULL train.jsonl at every stage regardless of SUBSET_PERCENTAGE - a
+    candidate that simply ignored the env var could train on 100% of the
+    data at the "1%" stage. write_subset is the host-side enforcement: the
+    file it writes must physically contain only the selected rows, not the
+    full dataset with a hint attached.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        paths = generate_split(d, n=200, seed=11)
+        dst = os.path.join(d, "train_subset.jsonl")
+
+        write_subset(paths["train"], dst, 10, seed=11)
+
+        full_rows = load_dataset(paths["train"])
+        subset_rows = load_dataset(dst)
+        expected = load_subset(paths["train"], 10, seed=11)
+
+        assert len(subset_rows) < len(full_rows)
+        assert subset_rows == expected
 
 
 def test_omitted_seed_is_not_the_old_public_default_of_42():

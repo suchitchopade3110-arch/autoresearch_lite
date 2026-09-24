@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from approval.gate import await_approval_decision, create_approval_request, maybe_auto_approve
 from approval.store import ApprovalStore
+from eval.dataset import write_subset
 from generation.patch_generator import validate_and_apply_patch
 from generation.static_check import check_syntax_multi
 from observability.logging_config import bind, get_logger
@@ -14,13 +15,20 @@ from vcs.git_controller import MergeConflict
 
 
 def _run_eval_stages(script_path, out_dir, pred_path, eval_stages, sandbox, evaluator,
-                      metrics_calculator, failure_analyzer, truth, candidate_logger) -> Dict[str, Any]:
+                      metrics_calculator, failure_analyzer, truth, candidate_logger,
+                      train_path: Optional[str] = None) -> Dict[str, Any]:
     """
     Runs `script_path` through every eval stage and scores it - the same
     stage loop used by phase 1 (evaluate_only) and by phase 2's
     re-evaluation of a rebased candidate (see execute_generation below).
     Factored out so both call sites can never drift apart on what
     "evaluating a candidate" actually means.
+
+    train_path, if given, is the full training file; a HOST-SELECTED
+    subset of it (not just the SUBSET_PERCENTAGE env var) is mounted for
+    each stage - see eval/dataset.py:write_subset for why that matters
+    (a candidate that ignores the env var would otherwise train on the
+    full file at every stage regardless of what it claimed).
     """
     final_score = 0.0
     all_metrics: Dict[str, Any] = {}
@@ -32,39 +40,58 @@ def _run_eval_stages(script_path, out_dir, pred_path, eval_stages, sandbox, eval
     last_subset = None
     has_failure_flags = False
 
-    for stage in eval_stages:
-        subset = stage['subset_percentage']
-        threshold = stage['threshold']
+    # Separate from out_dir on purpose: out_dir is mounted as a whole rw
+    # directory (/app/out), so a file written directly into it would be
+    # visible (and writable) to the candidate. subset_dir is never mounted
+    # itself - only the one per-stage file inside it that
+    # train_path_override names explicitly.
+    subset_dir = tempfile.mkdtemp(prefix="autoresearch-subset-") if train_path else None
+    try:
+        for stage in eval_stages:
+            subset = stage['subset_percentage']
+            threshold = stage['threshold']
 
-        # Wipe any predictions left by the previous stage - without this, a
-        # stage that exits 0 without writing predictions.jsonl would be
-        # scored against the PRIOR stage's file.
-        if os.path.exists(pred_path):
-            os.remove(pred_path)
+            # Wipe any predictions left by the previous stage - without this, a
+            # stage that exits 0 without writing predictions.jsonl would be
+            # scored against the PRIOR stage's file.
+            if os.path.exists(pred_path):
+                os.remove(pred_path)
 
-        env = {"SUBSET_PERCENTAGE": str(subset)}
-        exec_result = sandbox.run_candidate(script_path, env_vars=env, out_dir=out_dir)
-        total_execution_time += exec_result.get('execution_time', 0.0)
-        exec_result['execution_time'] = total_execution_time
+            env = {"SUBSET_PERCENTAGE": str(subset)}
+            run_kwargs = {"env_vars": env, "out_dir": out_dir}
+            if train_path:
+                # Only passed when actually in use, so a test double with a
+                # narrower run_candidate(script_path, env_vars, out_dir)
+                # signature (no train_path_override) keeps working exactly
+                # as before wherever this feature isn't exercised.
+                run_kwargs["train_path_override"] = write_subset(
+                    train_path, os.path.join(subset_dir, "train_subset.jsonl"), subset,
+                )
+            exec_result = sandbox.run_candidate(script_path, **run_kwargs)
+            total_execution_time += exec_result.get('execution_time', 0.0)
+            exec_result['execution_time'] = total_execution_time
 
-        stage_success, stage_score, stage_mismatch = evaluator.evaluate_stage(
-            exec_result, subset, threshold, pred_path, truth, logger=candidate_logger
-        )
-        has_failure_flags = has_failure_flags or stage_mismatch
-        last_subset = subset
+            stage_success, stage_score, stage_mismatch = evaluator.evaluate_stage(
+                exec_result, subset, threshold, pred_path, truth, logger=candidate_logger
+            )
+            has_failure_flags = has_failure_flags or stage_mismatch
+            last_subset = subset
 
-        if not stage_success:
-            eval_passed = False
+            if not stage_success:
+                eval_passed = False
+                final_score = stage_score
+                cat, msg, tb = failure_analyzer(exec_result, False)
+                failure_category = cat
+                error_msg = msg
+                traceback_text = tb
+                all_metrics = metrics_calculator(exec_result)
+                break
+
             final_score = stage_score
-            cat, msg, tb = failure_analyzer(exec_result, False)
-            failure_category = cat
-            error_msg = msg
-            traceback_text = tb
             all_metrics = metrics_calculator(exec_result)
-            break
-
-        final_score = stage_score
-        all_metrics = metrics_calculator(exec_result)
+    finally:
+        if subset_dir:
+            shutil.rmtree(subset_dir, ignore_errors=True)
 
     return {
         'final_score': final_score,
@@ -100,7 +127,8 @@ class ConcurrentScheduler:
                           approval_store: Optional[ApprovalStore] = None,
                           approval_config: Optional[Dict[str, Any]] = None,
                           truth: Optional[Dict[str, int]] = None,
-                          baseline_store=None) -> List[Dict[str, Any]]:
+                          baseline_store=None,
+                          train_path: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Two phases, so a human is never a bottleneck on the sandbox pool:
 
@@ -221,6 +249,7 @@ class ConcurrentScheduler:
                     result = _run_eval_stages(
                         script_path, out_dir, pred_path, eval_stages, sandbox, evaluator,
                         metrics_calculator, failure_analyzer, truth, candidate_logger,
+                        train_path=train_path,
                     )
                 finally:
                     shutil.rmtree(out_dir, ignore_errors=True)
@@ -417,7 +446,7 @@ class ConcurrentScheduler:
                         reval = _run_eval_stages(
                             rebased_script_path, reval_out_dir, os.path.join(reval_out_dir, "predictions.jsonl"),
                             eval_stages, sandbox, evaluator, metrics_calculator, failure_analyzer, truth,
-                            candidate_logger,
+                            candidate_logger, train_path=train_path,
                         )
                     finally:
                         shutil.rmtree(reval_out_dir, ignore_errors=True)

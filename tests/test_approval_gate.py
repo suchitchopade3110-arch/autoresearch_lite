@@ -91,6 +91,49 @@ def test_human_decision_returned_promptly_without_waiting_for_full_timeout():
         assert decision == "approved"
 
 
+def test_decision_landing_exactly_at_the_deadline_returns_the_real_decision_not_timed_out():
+    """
+    Council audit finding: a human decision (via a separate process, e.g.
+    the dashboard) can land in the narrow window between
+    await_approval_decision's own "is it still pending" read and its
+    store.decide("timed_out") call once the deadline is reached. The old
+    code ignored decide()'s return value and always returned "timed_out"
+    in that case - the DB correctly held "approved" while the function
+    (and the orchestrator's own log/outcome record) disagreed with it.
+    decide() returning False (a no-op, since status was no longer
+    'pending') must make this re-read and return the REAL persisted
+    decision instead.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        store = ApprovalStore(os.path.join(d, "approvals.db"))
+        state = {"calls": 0, "decided": False}
+
+        def racing_time_fn():
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return 0.0  # sets deadline = 0.0 + timeout_seconds
+            if not state["decided"]:
+                # Simulates a human's approval landing in the exact instant
+                # await_approval_decision itself discovers the deadline
+                # has passed.
+                request_id = store.list_pending()[-1]["id"]
+                store.decide(request_id, "approved", note="landed right at the deadline")
+                state["decided"] = True
+            return 100.0  # past the deadline every call from here on
+
+        decision = request_and_await_approval(
+            store, "cand-1", "goal", "diff", 0.9, {},
+            config={"approval": {"enabled": True, "timeout_seconds": 10, "poll_interval_seconds": 1}},
+            sleep_fn=lambda s: None,
+            time_fn=racing_time_fn,
+        )
+
+        assert decision == "approved"
+        persisted = store.list_all()[0]
+        assert persisted["status"] == "approved"
+        assert persisted["decision_note"] == "landed right at the deadline"
+
+
 def test_rejection_returned_directly():
     with tempfile.TemporaryDirectory() as d:
         store = ApprovalStore(os.path.join(d, "approvals.db"))

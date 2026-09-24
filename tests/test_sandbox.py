@@ -301,6 +301,52 @@ def test_gpu_access_is_granted_only_when_explicitly_configured():
         os.remove(script_path)
 
 
+def test_run_candidate_mounts_train_path_override_instead_of_dataset_dir_train():
+    """
+    Council audit finding: progressive-scaling stages used to mount the
+    SAME full train.jsonl (from dataset_dir) at every stage - SUBSET_PERCENTAGE
+    was only an environment variable a candidate's own code could ignore.
+    train_path_override lets a caller (eval/dataset.py:write_subset, driven
+    by orchestrator/run.py and evolution/scheduler.py) mount a
+    host-selected subset file instead - it must be what actually lands in
+    the docker command, not the full dataset_dir file, and test.jsonl must
+    be untouched (the test set stays whole at every stage).
+    """
+    with tempfile.TemporaryDirectory() as dataset_dir:
+        with open(os.path.join(dataset_dir, "train.jsonl"), "w") as f:
+            f.write('{"x1": 1.0, "x2": 1.0, "label": 1}\n')
+        with open(os.path.join(dataset_dir, "test.jsonl"), "w") as f:
+            f.write('{"id": 0, "x1": 1.0, "x2": 1.0}\n')
+
+        with tempfile.TemporaryDirectory() as subset_dir:
+            subset_path = os.path.join(subset_dir, "train_subset.jsonl")
+            with open(subset_path, "w") as f:
+                f.write('{"x1": 0.5, "x2": 0.5, "label": 0}\n')
+
+            with tempfile.NamedTemporaryFile(suffix='.py', delete=False) as f:
+                script_path = f.name
+            try:
+                with patch("sandbox.executor.subprocess.run") as mock_run:
+                    mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+                    executor = SandboxExecutor(
+                        {'timeout_seconds': 10, 'cpu_limit': "0.5", 'memory_limit': "256m"},
+                        dataset_dir=dataset_dir,
+                    )
+                    executor.run_candidate(script_path, train_path_override=subset_path)
+
+                    run_call = next(c for c in mock_run.call_args_list if c.args[0][:2] == ["docker", "run"])
+                    cmd = run_call.args[0]
+
+                    train_mount = next(a for a in cmd if a.endswith(":/app/data/train.jsonl:ro"))
+                    assert os.path.abspath(subset_path) in train_mount
+                    assert os.path.join(dataset_dir, "train.jsonl") not in train_mount
+
+                    test_mount = next(a for a in cmd if a.endswith(":/app/data/test.jsonl:ro"))
+                    assert os.path.join(dataset_dir, "test.jsonl") in test_mount
+            finally:
+                os.remove(script_path)
+
+
 def test_run_candidate_refuses_a_symlinked_script_path():
     """
     Defense in depth against a candidate-controlled path being a symlink -

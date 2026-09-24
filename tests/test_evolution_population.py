@@ -114,3 +114,101 @@ def test_generate_candidate_creates_and_cleans_up_worktree_on_exhaustion(tmp_dir
     assert result is None
     assert os.listdir(os.path.join(tmp_dir, "worktrees")) == []
     assert list(git_controller.repo.heads) == [git_controller.repo.heads[git_controller.original_branch]]
+
+
+def _make_engine(tmp_dir, repo_dir):
+    git_controller = GitController(repo_path=repo_dir, worktree_root=os.path.join(tmp_dir, "worktrees"))
+    db = ExperimentDB(db_path=os.path.join(tmp_dir, "chroma"))
+    config = {"evolution": {"duplicate_threshold": 0.25}, "eval": {"stages": []}}
+    engine = EvolutionEngine(
+        config=config,
+        git_controller=git_controller,
+        sandbox=MagicMock(),
+        evaluator=None,
+        metrics_calculator=calculate_all_metrics,
+        failure_analyzer=analyze_failure,
+        patch_generator=PatchGenerator(_AlwaysSameDiffClient()),
+        prompt_builder=PromptBuilder(db, {}),
+        db=db,
+    )
+    return engine, git_controller, db
+
+
+def test_carry_over_elite_skips_a_merged_parent(tmp_dir):
+    """
+    Council audit finding: if the elite parent actually merged, its change
+    is already part of the current base - blindly re-applying the same
+    diff on top of that base wastes a full sandbox slot on either a no-op
+    or a hard apply failure (the diff's removed-line context no longer
+    matches). A merged parent must never be carried over.
+    """
+    repo_dir = _init_repo(tmp_dir)
+    engine, git_controller, db = _make_engine(tmp_dir, repo_dir)
+
+    merged_parent = {"diff": "--- a/candidate_script.py\n+++ b/candidate_script.py\n@@ -1 +1 @@\n-\n+print('merged')\n", "goal": "goal", "success": True}
+
+    result = engine._carry_over_elite("goal", merged_parent)
+
+    assert result is None
+    assert os.listdir(os.path.join(tmp_dir, "worktrees")) == []
+
+
+def test_carry_over_elite_skips_a_duplicate_of_memory(tmp_dir):
+    """A held-but-unmerged parent whose diff already matches something on record must not burn a slot either."""
+    repo_dir = _init_repo(tmp_dir)
+    engine, git_controller, db = _make_engine(tmp_dir, repo_dir)
+    db.store_experiment(hypothesis="goal", diff=DUPLICATE_DIFF, rationale="seed", metrics={}, outcome="success")
+
+    held_parent = {"diff": DUPLICATE_DIFF, "goal": "goal", "success": False}
+
+    result = engine._carry_over_elite("goal", held_parent)
+
+    assert result is None
+    assert os.listdir(os.path.join(tmp_dir, "worktrees")) == []
+
+
+def test_carry_over_elite_skips_a_diff_that_no_longer_applies_and_rolls_back(tmp_dir):
+    """
+    A parent's diff generated against a stale base may simply fail to
+    apply against the CURRENT base - it must be dry-run-checked, not
+    handed straight to the scheduler where a real apply failure would be
+    recorded as a "runtime" crash instead of being caught here.
+    """
+    repo_dir = _init_repo(tmp_dir)
+    engine, git_controller, db = _make_engine(tmp_dir, repo_dir)
+
+    stale_parent = {
+        "diff": "--- a/candidate_script.py\n+++ b/candidate_script.py\n@@ -1 +1 @@\n-this line does not exist in the base\n+print('stale')\n",
+        "goal": "goal",
+        "success": False,
+    }
+
+    result = engine._carry_over_elite("goal", stale_parent)
+
+    assert result is None
+    # The worktree it tentatively created for the dry-run check is rolled
+    # back, not left behind.
+    assert os.listdir(os.path.join(tmp_dir, "worktrees")) == []
+    assert list(git_controller.repo.heads) == [git_controller.repo.heads[git_controller.original_branch]]
+
+
+def test_carry_over_elite_succeeds_for_a_valid_unmerged_parent(tmp_dir):
+    repo_dir = _init_repo(tmp_dir)
+    engine, git_controller, db = _make_engine(tmp_dir, repo_dir)
+
+    held_parent = {
+        "diff": "--- a/candidate_script.py\n+++ b/candidate_script.py\n@@ -1 +1 @@\n-\n+print('still good')\n",
+        "goal": "goal",
+        "success": False,
+    }
+
+    result = engine._carry_over_elite("goal", held_parent)
+
+    assert result is not None
+    assert result["diff"] == held_parent["diff"]
+    assert os.path.isdir(result["worktree_path"])
+    # dry_run=True (matching _generate_candidate's own contract): only
+    # checked, not actually applied yet - the scheduler's phase 1 applies
+    # it for real. The worktree's content is still the pristine base.
+    with open(os.path.join(result["worktree_path"], "candidate_script.py")) as f:
+        assert f.read() == "\n"

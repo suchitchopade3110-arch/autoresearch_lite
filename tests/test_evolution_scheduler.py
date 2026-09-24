@@ -135,6 +135,76 @@ def test_syntax_error_is_rejected_before_ever_reaching_the_sandbox(tmp_dir):
     assert evaluated[0]["failure_category"] == "syntax_error"
 
 
+def test_progressive_stages_mount_a_host_selected_subset_not_the_full_train_file(tmp_dir):
+    """
+    Council audit finding: progressive-scaling stages used to mount the
+    SAME full train.jsonl at every stage - SUBSET_PERCENTAGE was only an
+    environment variable a candidate's own code could ignore entirely, and
+    still see (and train on) 100% of the data at every stage. When
+    train_path is supplied, each stage must instead receive a
+    train_path_override pointing at a file containing only that stage's
+    subset - and different stages must get DIFFERENT subset files, not the
+    same one reused throughout.
+    """
+    repo_dir = _init_repo(tmp_dir)
+    git_controller = GitController(repo_dir, worktree_root=os.path.join(tmp_dir, "worktrees"))
+
+    full_train_path = os.path.join(tmp_dir, "train.jsonl")
+    with open(full_train_path, "w") as f:
+        for i in range(100):
+            f.write(f'{{"x1": {i}.0, "x2": 0.0, "label": {i % 2}}}\n')
+
+    # The override path is reused (overwritten) across stages and its
+    # directory is cleaned up once execute_generation returns, so the
+    # ROW COUNT must be captured immediately, at call time, not read back
+    # from the path afterwards.
+    seen_row_counts = []
+    seen_overrides = []
+
+    class RecordingSandbox:
+        def run_candidate(self, script_path, env_vars=None, out_dir=None, train_path_override=None):
+            seen_overrides.append(train_path_override)
+            with open(train_path_override) as f:
+                seen_row_counts.append(len(f.read().strip().splitlines()))
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, "predictions.jsonl"), "w") as f:
+                f.write('{"id": "0", "pred": 1}\n')
+            return {"exit_code": 0, "stdout": "", "stderr": "", "execution_time": 0.01, "timeout": False}
+
+    store = ApprovalStore(os.path.join(tmp_dir, "approvals.db"))
+    evaluator = MagicMock()
+    evaluator.evaluate_stage.return_value = (True, 0.9, False)
+
+    diff = (
+        "--- a/candidate_script.py\n"
+        "+++ b/candidate_script.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-\n"
+        "+print('hi')\n"
+    )
+    candidates = [{"id": "aaa", "diff": diff, "goal": "g"}]
+    scheduler = ConcurrentScheduler(max_workers=1)
+
+    scheduler.execute_generation(
+        candidates,
+        eval_stages=[{"subset_percentage": 5, "threshold": 0.5}, {"subset_percentage": 50, "threshold": 0.5}],
+        git_controller=git_controller,
+        sandbox=RecordingSandbox(),
+        evaluator=evaluator,
+        metrics_calculator=lambda r: {},
+        failure_analyzer=lambda r, passed: ("failure", ""),
+        approval_store=store,
+        approval_config={"approval": {"enabled": False}},
+        truth={"0": 1},
+        train_path=full_train_path,
+    )
+
+    assert len(seen_overrides) == 2
+    assert all(seen_overrides)  # never None/empty - always a real path
+    assert all(p != full_train_path for p in seen_overrides)  # never the full file itself
+    assert seen_row_counts[0] < seen_row_counts[1] < 100  # 5% stage < 50% stage < the full 100 rows
+
+
 class _FlippingBaselineStore:
     """
     A baseline whose .passes() answer changes between calls, simulating

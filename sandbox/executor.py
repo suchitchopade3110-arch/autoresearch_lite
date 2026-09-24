@@ -69,7 +69,8 @@ class SandboxExecutor:
         )
 
     def run_candidate(self, script_path: str, env_vars: Optional[Dict[str, str]] = None,
-                       out_dir: Optional[str] = None, extra_files: Optional[List[str]] = None) -> Dict[str, Any]:
+                       out_dir: Optional[str] = None, extra_files: Optional[List[str]] = None,
+                       train_path_override: Optional[str] = None) -> Dict[str, Any]:
         """
         Runs the given script inside the docker sandbox. extra_files are
         additional worktree paths (for multi-file candidates - see
@@ -78,6 +79,16 @@ class SandboxExecutor:
         scoped explicitly per-file the same way that mount already is,
         never as a mount of the whole worktree directory (which would also
         expose .git and anything else sitting in there).
+
+        train_path_override, if given, is mounted at /app/data/train.jsonl
+        INSTEAD OF dataset_dir/train.jsonl - the caller's way of actually
+        enforcing progressive-scaling subsets (see eval/dataset.py:
+        write_subset). Without it, every stage mounts the SAME full
+        training file regardless of SUBSET_PERCENTAGE, which is then only
+        an environment variable a candidate's own code may simply ignore.
+        test.jsonl is never subsetted - the test set stays whole at every
+        stage so scores remain comparable across stages (see
+        eval/dataset.py:subset_indices).
         """
         start_time = time.time()
         container_name = f"sandbox-{uuid.uuid4().hex[:8]}"
@@ -94,6 +105,8 @@ class SandboxExecutor:
         for candidate_path in [script_path, *(extra_files or [])]:
             if os.path.islink(candidate_path):
                 raise ValueError(f"Refusing to mount a symlink into the sandbox: {candidate_path}")
+        if train_path_override and os.path.islink(train_path_override):
+            raise ValueError(f"Refusing to mount a symlink into the sandbox: {train_path_override}")
 
         # A bind mount carries the HOST file's real permission bits into the
         # container - the sandbox's UID (1000) is never the host process's
@@ -129,12 +142,13 @@ class SandboxExecutor:
             cmd += ["--gpus", self.gpus]
 
         run_env = dict(env_vars or {})
-        if self.dataset_dir:
-            train_path = os.path.join(self.dataset_dir, "train.jsonl")
-            test_path = os.path.join(self.dataset_dir, "test.jsonl")
-            cmd += ["-v", f"{train_path}:/app/data/train.jsonl:ro"]
-            cmd += ["-v", f"{test_path}:/app/data/test.jsonl:ro"]
+        if self.dataset_dir or train_path_override:
+            train_path = train_path_override or os.path.join(self.dataset_dir, "train.jsonl")
+            cmd += ["-v", f"{os.path.abspath(train_path)}:/app/data/train.jsonl:ro"]
             run_env.setdefault("TRAIN_PATH", "/app/data/train.jsonl")
+        if self.dataset_dir:
+            test_path = os.path.join(self.dataset_dir, "test.jsonl")
+            cmd += ["-v", f"{test_path}:/app/data/test.jsonl:ro"]
             run_env.setdefault("TEST_PATH", "/app/data/test.jsonl")
 
         if out_dir:

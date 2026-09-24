@@ -10,7 +10,7 @@ from config_schema import ConfigError, load_config
 from observability.logging_config import bind, configure_logging, get_logger
 from vcs.git_controller import GitController, MergeConflict
 from sandbox.executor import SandboxExecutor
-from eval.dataset import generate_split, load_truth
+from eval.dataset import generate_split, load_truth, write_subset
 from eval.baseline import BaselineStore
 from eval.pipeline import EvalPipeline
 from orchestrator.metrics import calculate_all_metrics
@@ -217,6 +217,7 @@ def main():
             truth=truth,
             baseline_store=baseline_store,
             run_id=run_id,
+            train_path=dataset_paths['train'],
         )
         engine.run(args.goal)
         generate_report(db, approval_store, logger=logger)
@@ -307,6 +308,12 @@ def main():
         # below - nothing after the stage loop needs it.
         out_dir = tempfile.mkdtemp(prefix="autoresearch-out-")
         pred_path = os.path.join(out_dir, "predictions.jsonl")
+        # Separate from out_dir on purpose: out_dir is mounted as a whole
+        # rw directory (/app/out), so a file written directly into it would
+        # be visible (and writable) to the candidate. subset_dir is never
+        # mounted itself - only the one per-stage file inside it that
+        # train_path_override names explicitly.
+        subset_dir = tempfile.mkdtemp(prefix="autoresearch-subset-")
 
         eval_passed = True
         final_score = 0.0
@@ -328,10 +335,19 @@ def main():
                 if os.path.exists(pred_path):
                     os.remove(pred_path)
 
+                # Host-selected subset, not just the SUBSET_PERCENTAGE env
+                # var - without this, every stage mounted the SAME full
+                # train.jsonl, and a candidate that simply ignored the env
+                # var (or trained on the full file regardless of what it
+                # claimed) would never be caught.
+                subset_train_path = write_subset(
+                    dataset_paths['train'], os.path.join(subset_dir, "train_subset.jsonl"), subset,
+                )
+
                 candidate_logger.info(f"Running in sandbox (subset={subset}%)...")
                 execution_result = sandbox.run_candidate(
                     script_path, env_vars={"SUBSET_PERCENTAGE": str(subset)}, out_dir=out_dir,
-                    extra_files=extra_file_paths or None,
+                    extra_files=extra_file_paths or None, train_path_override=subset_train_path,
                 )
 
                 if execution_result['timeout']:
@@ -350,6 +366,7 @@ def main():
                     break
         finally:
             shutil.rmtree(out_dir, ignore_errors=True)
+            shutil.rmtree(subset_dir, ignore_errors=True)
 
         if eval_passed:
             candidate_logger.info("Candidate passed all evaluation stages.")

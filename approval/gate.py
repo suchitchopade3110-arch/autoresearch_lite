@@ -158,8 +158,21 @@ def await_approval_decision(
             return request["status"] if request else "timed_out"
 
         if time_fn() >= deadline:
-            store.decide(request_id, "timed_out", note="No decision within timeout window.")
-            return "timed_out"
+            # decide() only transitions a request that is still 'pending'
+            # (see approval/store.py) - a human decision (via the
+            # dashboard, a separate process) can land in the narrow window
+            # between the read above and this call. If it did, decide()
+            # returns False here having changed nothing, and the DB
+            # already holds that real decision - re-read and return IT,
+            # rather than returning "timed_out" while the persisted record
+            # says "approved"/"rejected". Both outcomes still roll back
+            # the same way for a caller that isn't exactly "approved", so
+            # this is a correctness fix for the returned/logged value
+            # matching the DB, not a change in whether anything merges.
+            if store.decide(request_id, "timed_out", note="No decision within timeout window."):
+                return "timed_out"
+            final = store.get_request(request_id)
+            return final["status"] if final else "timed_out"
 
         sleep_fn(approval_cfg["poll_interval_seconds"])
 
