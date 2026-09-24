@@ -22,6 +22,14 @@ def test_printed_score_claim_is_never_trusted(tmp_dir):
     perfect score claim, must not be able to buy a merge that way. The eval
     pipeline must score real predictions against held-out truth, never
     anything the candidate writes to stdout.
+
+    Calls evaluate_stage() itself, not just score_predictions() - the
+    lower-level function that never even looks at stdout in the first
+    place, so a test built only on it can't actually prove a printed claim
+    is ignored by the code path that DOES read stdout (evaluate_stage's
+    own _parse_score/mismatch check). evaluate_stage is what
+    orchestrator/run.py and evolution/scheduler.py actually call to decide
+    whether a candidate passes a stage.
     """
     script_path = os.path.join(tmp_dir, "candidate_script.py")
     with open(script_path, "w") as f:
@@ -29,15 +37,28 @@ def test_printed_score_claim_is_never_trusted(tmp_dir):
 
     result = subprocess.run([sys.executable, script_path], capture_output=True, text=True)
     assert "SCORE: 1.0" in result.stdout  # sanity: the candidate did make the claim
+    assert result.returncode == 0  # sanity: this isn't caught by the exit-code check either
 
     pred_path = os.path.join(tmp_dir, "predictions.jsonl")  # the script wrote nothing here
     truth = {"0": 1, "1": 0, "2": 1, "3": 0}
+    execution_result = {
+        "exit_code": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "timeout": False,
+    }
 
     pipeline = EvalPipeline(CONFIG)
-    score, reason = pipeline.score_predictions(pred_path, truth)
+    success, score, mismatch = pipeline.evaluate_stage(execution_result, 100, 0.5, pred_path, truth)
 
+    assert success is False  # the perfect claim buys no credit at all
     assert score == 0.0
-    assert reason  # a real reason string, not silent 0.0
+    assert mismatch is True  # the lie is flagged, even though it's never trusted for gating
+
+    # score_predictions() alone (used by the assertion above's evaluate_stage
+    # internally) must also report a real reason, not a silent 0.0.
+    _, reason = pipeline.score_predictions(pred_path, truth)
+    assert reason
 
 
 def test_partial_prediction_coverage_gets_no_partial_credit(tmp_dir):

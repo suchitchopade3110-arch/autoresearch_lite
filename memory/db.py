@@ -6,6 +6,17 @@ import uuid
 import json
 from datetime import datetime, timezone
 
+from memory.embeddings import HashingEmbeddingFunction
+
+# Set only by tests/conftest.py, never in production - swaps chromadb's
+# real DefaultEmbeddingFunction (which lazily downloads an ONNX model from
+# HuggingFace on first use) for a dependency-free, deterministic stub, so
+# the test suite never silently depends on network access or a pre-warmed
+# model cache having already happened in whatever environment runs it. See
+# memory/embeddings.py:HashingEmbeddingFunction's docstring.
+_HERMETIC_EMBEDDINGS_ENV_VAR = "AUTORESEARCH_HERMETIC_EMBEDDINGS"
+
+
 class ExperimentDB:
     """
     RAG-style memory of past candidates, backed by a local ChromaDB
@@ -16,10 +27,15 @@ class ExperimentDB:
     near-duplicates already tried - both by nearest-neighbor search over
     the same collection, not separate stores.
     """
-    def __init__(self, db_path: str = "./chroma_db"):
+    def __init__(self, db_path: str = "./chroma_db", embedding_function=None):
         self.client = chromadb.PersistentClient(path=db_path)
-        # using default sentence-transformers model embedded in chromadb
-        self.ef = embedding_functions.DefaultEmbeddingFunction()
+        if embedding_function is not None:
+            self.ef = embedding_function
+        elif os.environ.get(_HERMETIC_EMBEDDINGS_ENV_VAR) == "1":
+            self.ef = HashingEmbeddingFunction()
+        else:
+            # using default sentence-transformers model embedded in chromadb
+            self.ef = embedding_functions.DefaultEmbeddingFunction()
         # cosine distance is bounded and near 0 for near-identical text, which
         # is what duplicate_checker.py's small default threshold (0.1) assumes -
         # chromadb's collection default (L2) doesn't range near 0 for this kind

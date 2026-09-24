@@ -1,7 +1,18 @@
+import os
 import shutil
 import tempfile
 
 import pytest
+
+# Makes every ExperimentDB() constructed anywhere in this test suite use
+# memory/embeddings.py's dependency-free HashingEmbeddingFunction instead
+# of chromadb's real DefaultEmbeddingFunction (which lazily downloads an
+# ONNX model from HuggingFace on first use) - set here, once, before any
+# test module imports memory.db, rather than threading an explicit
+# embedding_function= kwarg through every one of the ~30 ExperimentDB(...)
+# call sites across the suite. Never set outside tests/conftest.py: a real
+# run must always get the real embedding function.
+os.environ["AUTORESEARCH_HERMETIC_EMBEDDINGS"] = "1"
 
 
 @pytest.fixture
