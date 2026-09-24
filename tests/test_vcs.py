@@ -156,6 +156,70 @@ def test_second_conflicting_merge_raises_and_leaves_the_main_checkout_clean(repo
         assert not os.path.exists(worktree_b)
 
 
+def test_merge_never_switches_the_active_branch_when_base_ref_differs(repo_dir):
+    """
+    Council audit finding: with base_ref naming a branch other than the one
+    the caller currently has checked out (e.g. user on "my-feature",
+    base_ref="main"), the old implementation's `git checkout <base>` would
+    silently switch the caller's active branch. merge() must advance
+    base_ref's own tip without ever touching what's checked out.
+    """
+    repo = git.Repo(repo_dir)
+    try:
+        base_branch_name = repo.active_branch.name
+        repo.git.checkout("-b", "my-feature")
+    finally:
+        repo.close()
+
+    controller = GitController(repo_dir, base_ref=base_branch_name)
+    branch_name, worktree_path = controller.create_branch("123")
+    with open(os.path.join(worktree_path, "test.txt"), "w") as f:
+        f.write("changed by candidate")
+    controller.commit_patch(worktree_path)
+
+    controller.merge(branch_name, worktree_path)
+
+    repo = git.Repo(repo_dir)
+    try:
+        assert repo.active_branch.name == "my-feature"  # never switched
+        base_tip = repo.commit(base_branch_name)
+        assert base_tip.tree["test.txt"].data_stream.read().decode() == "changed by candidate"
+    finally:
+        repo.close()
+
+
+def test_merge_does_not_crash_when_main_worktree_has_uncommitted_changes(repo_dir):
+    """
+    Council audit finding: a dirty main working tree used to raise an
+    uncaught GitCommandError from `git merge --ff-only` (not MergeConflict),
+    crashing the run after approval was already recorded and leaking the
+    candidate's worktree/branch. The ref must still advance; only the
+    working-tree sync is skipped.
+    """
+    with open(os.path.join(repo_dir, "test.txt"), "w") as f:
+        f.write("dirty uncommitted change")  # never committed
+
+    controller = GitController(repo_dir)
+    original_branch = controller.original_branch
+
+    branch_name, worktree_path = controller.create_branch("dirty-case")
+    with open(os.path.join(worktree_path, "other.txt"), "w") as f:
+        f.write("from candidate")
+    controller.commit_patch(worktree_path)
+
+    controller.merge(branch_name, worktree_path)  # must not raise
+
+    # The ref genuinely advanced (the candidate's commit is now an ancestor
+    # of the branch tip) even though the working tree was left untouched.
+    assert branch_name not in [h.name for h in controller.repo.heads]
+    tip = controller.repo.commit(original_branch)
+    assert "other.txt" in tip.tree
+    # The caller's uncommitted change is exactly as they left it - never
+    # touched, never destroyed.
+    with open(os.path.join(repo_dir, "test.txt")) as f:
+        assert f.read() == "dirty uncommitted change"
+
+
 def test_detached_head_does_not_crash_init_and_can_still_create_branches(repo_dir):
     """
     Wave 3 acceptance: a target repo checked out at a specific commit
@@ -261,6 +325,38 @@ def test_cleanup_orphans_removes_leftover_worktrees_and_branches_from_a_crashed_
         assert fresh_controller.repo.active_branch.name == original_branch
         with open(os.path.join(repo_dir, "test.txt")) as f:
             assert f.read() == "initial state"
+
+
+def test_cleanup_orphans_spares_young_worktrees_when_min_age_is_set(repo_dir):
+    """
+    Council audit finding: git's worktree registry is repo-global, so a
+    second orchestrator process started against the same repo_path would
+    otherwise see a still-running first process's own in-flight candidates
+    as "orphaned" and delete them out from under it. min_age_seconds is the
+    guard orchestrator/run.py's real startup path now sets (to the
+    approval gate's timeout) - a worktree freshly touched (well within that
+    window) must survive cleanup_orphans, while one old enough is still
+    reclaimed exactly as before.
+    """
+    with tempfile.TemporaryDirectory() as worktree_root:
+        controller = GitController(repo_dir, worktree_root=worktree_root)
+        branch_name, worktree_path = controller.create_branch("still-active")
+        with open(os.path.join(worktree_path, "test.txt"), "w") as f:
+            f.write("in-flight work another process is still doing")
+        controller.commit_patch(worktree_path)
+
+        result = controller.cleanup_orphans(min_age_seconds=3600)  # 1 hour - this worktree is seconds old
+
+        assert result == {"removed_worktrees": 0, "removed_branches": 0}
+        assert os.path.exists(worktree_path)
+        assert branch_name in [h.name for h in controller.repo.heads]
+
+        # The same worktree, with no minimum age, is reclaimed exactly as
+        # cleanup_orphans always has been for a genuinely crashed run.
+        result = controller.cleanup_orphans(min_age_seconds=0)
+        assert result == {"removed_worktrees": 1, "removed_branches": 1}
+        assert not os.path.exists(worktree_path)
+        assert branch_name not in [h.name for h in controller.repo.heads]
 
 
 def test_cleanup_orphans_is_a_noop_when_nothing_is_orphaned(repo_dir):

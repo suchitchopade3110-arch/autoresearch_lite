@@ -115,8 +115,19 @@ def score_candidates(candidates: List[Dict[str, Any]], config: Dict[str, Any]) -
     # capped at 1.0. Shifting every failure's score down by the same amount
     # preserves relative order within the successes and within the
     # failures, and just guarantees the two groups never cross.
-    successful = [c['composite_score'] for c in candidates if c.get('success')]
-    failed = [c for c in candidates if not c.get('success')]
+    #
+    # Keyed on eval_passed (cleared every real held-out stage), NOT
+    # `success` (== actually merged - requires eval_passed AND approval AND
+    # a clean finalize). In a generation where nothing merges (held for
+    # human review, or every rebase conflicts) `success` is False for every
+    # single candidate, so a `success`-keyed clamp is a no-op: an instant
+    # crash could then out-score a candidate that scored 0.95+ on real
+    # held-out data, and go on to become a selected parent/elite. A
+    # candidate that genuinely passed evaluation but wasn't merged (held,
+    # or lost a rebase conflict after finalizing) still deserves to rank
+    # above one that never passed at all.
+    successful = [c['composite_score'] for c in candidates if c.get('eval_passed')]
+    failed = [c for c in candidates if not c.get('eval_passed')]
     if successful and failed:
         min_success = min(successful)
         max_failure = max(c['composite_score'] for c in failed)

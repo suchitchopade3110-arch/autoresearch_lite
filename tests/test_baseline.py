@@ -4,9 +4,19 @@ import os
 from eval.baseline import BaselineStore
 
 
-def test_get_defaults_to_zero_with_no_history(tmp_dir):
+def test_get_returns_none_with_no_history(tmp_dir):
+    """
+    Council audit critical finding: get() used to default to 0.0 for an
+    absent stage, which made a fresh baseline indistinguishable from "the
+    best-ever score was literally 0.0" to callers computing an
+    improvement-over-baseline delta (see approval/gate.py's auto-approve
+    criterion) - a candidate with ANY positive score looked like a huge
+    improvement over a baseline that, in truth, doesn't exist yet. None
+    means exactly "nothing to compare against"; passes() (below) is the
+    one place a 0.0 floor is still correct, for a different reason.
+    """
     store = BaselineStore(os.path.join(tmp_dir, "state.json"))
-    assert store.get(100) == 0.0
+    assert store.get(100) is None
 
 
 def test_update_if_better_persists_across_instances(tmp_dir):

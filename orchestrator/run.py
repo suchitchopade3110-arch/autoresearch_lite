@@ -1,7 +1,9 @@
 import argparse
 import os
+import shutil
 import signal
 import sys
+import tempfile
 import uuid
 
 from config_schema import ConfigError, load_config
@@ -43,15 +45,27 @@ def run_startup_cleanup(vcs: GitController, approval_store: ApprovalStore, confi
     before an approval request it was awaiting ever timed out on its own.
     Safe to run unconditionally - both operations are no-ops when nothing
     was actually left behind.
+
+    min_age_seconds=timeout_seconds (not 0): git's worktree registry is
+    repo-global, so a second orchestrator process started against the same
+    repo_path while this one is still running would otherwise see this
+    process's own in-flight candidates as "orphaned" and delete them (see
+    vcs/git_controller.py:cleanup_orphans's docstring). A candidate
+    worktree younger than the approval gate's own timeout could still be
+    legitimately in flight; one older than it would already have timed out
+    its own approval wait regardless, so reclaiming it is safe either way.
+    This narrows that race, it doesn't close it outright - concurrent
+    orchestrator runs against the same repo_path are still not fully safe.
     """
-    result = vcs.cleanup_orphans()
+    timeout_seconds = resolve_approval_config(config)["timeout_seconds"]
+
+    result = vcs.cleanup_orphans(min_age_seconds=timeout_seconds)
     if result["removed_worktrees"] or result["removed_branches"]:
         logger.info(
             f"Crash recovery: removed {result['removed_worktrees']} orphan worktree(s) and "
             f"{result['removed_branches']} orphan branch(es) left by a previous run."
         )
 
-    timeout_seconds = resolve_approval_config(config)["timeout_seconds"]
     timed_out = approval_store.timeout_stale_requests(timeout_seconds)
     if timed_out:
         logger.info(f"Crash recovery: timed out {timed_out} approval request(s) left pending past their deadline.")
@@ -127,10 +141,16 @@ def main():
     target_cfg = config.get('target', {})
 
     dataset_dir = dataset_cfg.get('path', 'dummy_data')
+    # dataset.seed is intentionally NOT defaulted to a fixed value here -
+    # leaving it unset lets generate_split pick a fresh, secret, host-only
+    # seed (see eval/dataset.py's docstring for why a fixed/public seed lets
+    # a candidate regenerate the held-out labels without ever touching
+    # truth.json). Only set dataset.seed in config for a reproducible test
+    # fixture, never for a real run.
     dataset_paths = generate_split(
         dataset_dir,
         n=dataset_cfg.get('size', 1000),
-        seed=dataset_cfg.get('seed', 42),
+        seed=dataset_cfg.get('seed'),
         test_frac=dataset_cfg.get('test_frac', 0.25),
     )
     # truth.json is loaded host-side only - it is never mounted into the
@@ -275,7 +295,17 @@ def main():
         # writes predictions.jsonl to out_dir - that, scored against
         # held-out truth, is the only real score; anything the candidate
         # prints is a diagnostic at best (see eval/pipeline.py).
-        out_dir = os.path.join(worktree_path, ".eval_out")
+        # Deliberately a fresh host tempdir, NOT a path under worktree_path:
+        # this is where the sandbox's rw bind mount points, and the
+        # worktree's contents are exactly what a candidate's diff controls.
+        # A path inside the worktree can be turned into a symlink (e.g.
+        # .eval_out -> ../../dummy_data, giving the sandbox rw access to the
+        # dataset directory - or worse, .git/hooks, a route to host code
+        # execution). vcs/diff_guard.py already refuses such a diff outright,
+        # but a tempdir the diff never gets a chance to name is immune to
+        # this regardless of any gap in that guard. Removed in the `finally`
+        # below - nothing after the stage loop needs it.
+        out_dir = tempfile.mkdtemp(prefix="autoresearch-out-")
         pred_path = os.path.join(out_dir, "predictions.jsonl")
 
         eval_passed = True
@@ -285,33 +315,41 @@ def main():
         execution_result = None
         has_failure_flags = False
 
-        for stage in eval_stages:
-            subset = stage['subset_percentage']
-            threshold = stage['threshold']
+        try:
+            for stage in eval_stages:
+                subset = stage['subset_percentage']
+                threshold = stage['threshold']
 
-            candidate_logger.info(f"Running in sandbox (subset={subset}%)...")
-            execution_result = sandbox.run_candidate(
-                script_path, env_vars={"SUBSET_PERCENTAGE": str(subset)}, out_dir=out_dir,
-                extra_files=extra_file_paths or None,
-            )
+                # Wipe any predictions left by the previous stage - without
+                # this, a stage whose script exits 0 without writing
+                # predictions.jsonl would be scored against the PRIOR
+                # stage's file instead of failing with "no predictions
+                # written".
+                if os.path.exists(pred_path):
+                    os.remove(pred_path)
 
-            if execution_result['timeout']:
-                candidate_logger.warning("Execution TIMED OUT")
+                candidate_logger.info(f"Running in sandbox (subset={subset}%)...")
+                execution_result = sandbox.run_candidate(
+                    script_path, env_vars={"SUBSET_PERCENTAGE": str(subset)}, out_dir=out_dir,
+                    extra_files=extra_file_paths or None,
+                )
 
-            metrics = calculate_all_metrics(execution_result)
-            candidate_logger.info(f"Plugin Metrics: {metrics}")
+                if execution_result['timeout']:
+                    candidate_logger.warning("Execution TIMED OUT")
 
-            stage_success, final_score = evaluator.evaluate_stage(
-                execution_result, subset, threshold, pred_path, truth, logger=candidate_logger
-            )
-            # Read immediately after the call - evaluator is a single
-            # shared EvalPipeline instance across every candidate/stage
-            # (see eval/pipeline.py:last_stage_flags).
-            has_failure_flags = has_failure_flags or bool(evaluator.last_stage_flags.get("score_claim_mismatch", False))
-            last_subset = subset
-            if not stage_success:
-                eval_passed = False
-                break
+                metrics = calculate_all_metrics(execution_result)
+                candidate_logger.info(f"Plugin Metrics: {metrics}")
+
+                stage_success, final_score, stage_mismatch = evaluator.evaluate_stage(
+                    execution_result, subset, threshold, pred_path, truth, logger=candidate_logger
+                )
+                has_failure_flags = has_failure_flags or stage_mismatch
+                last_subset = subset
+                if not stage_success:
+                    eval_passed = False
+                    break
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
 
         if eval_passed:
             candidate_logger.info("Candidate passed all evaluation stages.")
@@ -321,8 +359,15 @@ def main():
         # best score ever actually merged for that stage. Without this, a
         # candidate that regresses relative to what's already in place can
         # still merge as long as it clears the (fixed) threshold.
-        baseline_score = baseline_store.get(last_subset) if last_subset is not None else 0.0
-        delta = final_score - baseline_score
+        #
+        # baseline_score is None (not 0.0) when nothing has ever merged at
+        # this stage - and so is delta, which feeds should_auto_approve's
+        # "improvement over baseline" criterion (see approval/gate.py). A
+        # candidate with no baseline to compare against must always fall
+        # through to human review, never auto-merge just because
+        # final_score - 0.0 trivially clears the auto-approve threshold.
+        baseline_score = baseline_store.get(last_subset) if last_subset is not None else None
+        delta = (final_score - baseline_score) if baseline_score is not None else None
         below_baseline = False
         if eval_passed and last_subset is not None:
             if not baseline_store.passes(last_subset, final_score, min_improvement):
@@ -330,11 +375,11 @@ def main():
                 eval_passed = False
                 candidate_logger.info(
                     f"Candidate {candidate_id} scored {final_score:.4f} at {last_subset}%, which does not beat "
-                    f"baseline {baseline_score:.4f} + min_improvement {min_improvement}. Rejecting despite "
-                    f"clearing the absolute threshold."
+                    f"baseline {baseline_score if baseline_score is not None else 0.0:.4f} + "
+                    f"min_improvement {min_improvement}. Rejecting despite clearing the absolute threshold."
                 )
 
-        metrics['baseline_score'] = baseline_score
+        metrics['baseline_score'] = baseline_score if baseline_score is not None else 0.0
         metrics['delta'] = delta
         # Consumed by approval/gate.py's should_auto_approve as the
         # require_no_failure_flags criterion - currently the only known

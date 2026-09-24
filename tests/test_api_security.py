@@ -146,3 +146,48 @@ def test_approve_with_matching_csrf_token_succeeds(configure_paths):
     )
     assert r.status_code == 303
     assert api_main.store.get_request(req_id)["status"] == "approved"
+
+
+def test_csrf_cookie_is_httponly(configure_paths):
+    """
+    Council audit finding: the CSRF cookie used to be set with
+    httponly=False for no functional reason - dashboard.html embeds the
+    token directly into each form's hidden field server-side, so no
+    client-side JS ever needs to read this cookie. Leaving it JS-readable
+    only widened the attack surface (browser cookies aren't port-isolated,
+    so another localhost:* page's script could read it), with nothing
+    gained in return.
+    """
+    os.environ["DASHBOARD_AUTH_DISABLED"] = "true"
+    api_main = _fresh_api_main()
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api_main.app)
+    r = client.get("/")
+    set_cookie = r.headers.get("set-cookie", "")
+    assert "csrf_token=" in set_cookie
+    assert "httponly" in set_cookie.lower()
+
+
+def test_dashboard_serves_its_own_css_with_no_external_script(configure_paths):
+    """
+    Council audit finding: the dashboard used to load
+    https://cdn.tailwindcss.com - an unpinned third-party script (no
+    possible Subresource Integrity hash, since it recompiles CSS
+    client-side) running on the exact page whose forms approve/reject
+    merges. It must now be entirely self-hosted with no external script tag.
+    """
+    os.environ["DASHBOARD_AUTH_DISABLED"] = "true"
+    api_main = _fresh_api_main()
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api_main.app)
+
+    page = client.get("/")
+    assert "cdn.tailwindcss.com" not in page.text
+    assert '<script' not in page.text
+    assert '/static/dashboard.css' in page.text
+
+    css = client.get("/static/dashboard.css")
+    assert css.status_code == 200
+    assert "text/css" in css.headers["content-type"]

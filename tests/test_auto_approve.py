@@ -193,11 +193,17 @@ def test_scheduler_merges_a_qualifying_candidate_without_a_human_decision(tmp_di
             return {"exit_code": 0, "stdout": "", "stderr": "", "execution_time": 0.01, "timeout": False}
 
     store = ApprovalStore(os.path.join(tmp_dir, "approvals.db"))
-    baseline_store = BaselineStore(os.path.join(tmp_dir, "state.json"))  # fresh -> baseline 0.0 for every stage
+    baseline_store = BaselineStore(os.path.join(tmp_dir, "state.json"))
+    # A genuine prior baseline - auto-approve must only ever fire against a
+    # real "improvement over what's already merged", never a fresh/absent
+    # baseline (see test_scheduler_never_auto_approves_on_a_fresh_baseline
+    # for that regression test - BaselineStore.get() used to default to 0.0
+    # for an absent stage, which let ANY passing candidate auto-merge on
+    # the very first run with no human ever in the loop).
+    baseline_store.update_if_better(100, 0.4)
 
     evaluator = MagicMock()
-    evaluator.evaluate_stage.return_value = (True, 1.0)
-    evaluator.last_stage_flags = {"score_claim_mismatch": False}
+    evaluator.evaluate_stage.return_value = (True, 1.0, False)
 
     candidates = [{"id": "aaa", "diff": "", "goal": "g"}]
     scheduler = ConcurrentScheduler(max_workers=1)
@@ -228,3 +234,68 @@ def test_scheduler_merges_a_qualifying_candidate_without_a_human_decision(tmp_di
 
     assert evaluated[0]["approval_decision"] == "auto_approved"
     assert evaluated[0]["success"] is True
+
+
+def test_scheduler_never_auto_approves_on_a_fresh_baseline(tmp_dir):
+    """
+    Council audit critical finding: BaselineStore.get() used to default to
+    0.0 for a stage with no history, so `delta = final_score - 0.0` looked
+    like a huge "improvement" and auto-approve fired on the very first
+    candidate a fresh install ever evaluates - no human ever in the loop,
+    even though should_auto_approve's own docstring promises "no baseline
+    to compare against ... never auto-approves". A fresh (freshly
+    constructed, no update_if_better ever called) baseline_store must fall
+    through to human approval every time, regardless of how high the score is.
+    """
+    repo_dir = _init_repo(tmp_dir)
+    git_controller = GitController(repo_dir, worktree_root=os.path.join(tmp_dir, "worktrees"))
+
+    class RecordingSandbox:
+        def run_candidate(self, script_path, env_vars=None, out_dir=None):
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, "predictions.jsonl"), "w") as f:
+                f.write('{"id": "0", "pred": 1}\n')
+            return {"exit_code": 0, "stdout": "", "stderr": "", "execution_time": 0.01, "timeout": False}
+
+    store = ApprovalStore(os.path.join(tmp_dir, "approvals.db"))
+    baseline_store = BaselineStore(os.path.join(tmp_dir, "state.json"))  # fresh - nothing ever merged
+
+    evaluator = MagicMock()
+    evaluator.evaluate_stage.return_value = (True, 1.0, False)  # a perfect score
+
+    candidates = [{"id": "aaa", "diff": "", "goal": "g"}]
+    scheduler = ConcurrentScheduler(max_workers=1)
+    # A permissive auto_approve threshold - would clearly fire if delta were
+    # ever computed against a 0.0 floor instead of None.
+    gate_config = {"approval": {"auto_approve": {"min_improvement_over_baseline": 0.01}}}
+
+    approved_ids = []
+
+    def recording_await(store_, request_id, config_, sleep_fn=None, time_fn=None):
+        approved_ids.append(request_id)
+        store_.decide(request_id, "approved", note="human approved it")
+        return "approved"
+
+    import evolution.scheduler as scheduler_module
+    original_await = scheduler_module.await_approval_decision
+    scheduler_module.await_approval_decision = recording_await
+    try:
+        evaluated = scheduler.execute_generation(
+            candidates,
+            eval_stages=[{"subset_percentage": 100, "threshold": 0.5}],
+            git_controller=git_controller,
+            sandbox=RecordingSandbox(),
+            evaluator=evaluator,
+            metrics_calculator=lambda r: {},
+            failure_analyzer=lambda r, passed: ("failure", ""),
+            approval_store=store,
+            approval_config=gate_config,
+            truth={"0": 1},
+            baseline_store=baseline_store,
+        )
+    finally:
+        scheduler_module.await_approval_decision = original_await
+
+    assert evaluated[0]["metrics"]["delta"] is None
+    assert approved_ids, "a fresh baseline must fall through to human review, not skip it"
+    assert evaluated[0]["approval_decision"] == "approved"

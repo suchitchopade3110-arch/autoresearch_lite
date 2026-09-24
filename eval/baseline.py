@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict
+from typing import Dict, Optional
 
 DEFAULT_MIN_IMPROVEMENT = 0.001
 
@@ -31,8 +31,18 @@ class BaselineStore:
         with open(self.path, "w") as f:
             json.dump({"baseline_scores": self._scores}, f)
 
-    def get(self, stage_key) -> float:
-        return self._scores.get(str(stage_key), 0.0)
+    def get(self, stage_key) -> Optional[float]:
+        """
+        Returns the best-known score for this stage, or None if nothing has
+        ever merged at it yet. None (not 0.0) matters to callers computing
+        "improvement over baseline" for approval.auto_approve's threshold
+        (see approval/gate.py:should_auto_approve): a candidate with
+        nothing to compare against isn't a 100%-improvement over a 0.0
+        floor, it's simply not comparable, and must always fall through to
+        human review rather than auto-merge on a fresh install.
+        """
+        key = str(stage_key)
+        return self._scores[key] if key in self._scores else None
 
     def update_if_better(self, stage_key, score: float) -> None:
         key = str(stage_key)
@@ -41,4 +51,12 @@ class BaselineStore:
             self._save()
 
     def passes(self, stage_key, score: float, min_improvement: float = DEFAULT_MIN_IMPROVEMENT) -> bool:
-        return score > self.get(stage_key) + min_improvement
+        """
+        The absolute merge gate: unlike get()'s auto-approve-facing Optional
+        return, a genuinely absent baseline here floors at 0.0 - a first
+        candidate (nothing merged yet at this stage) must still be able to
+        merge on its own eval-stage-threshold merits; there is nothing yet
+        to have "regressed" relative to.
+        """
+        baseline = self.get(stage_key)
+        return score > (baseline if baseline is not None else 0.0) + min_improvement

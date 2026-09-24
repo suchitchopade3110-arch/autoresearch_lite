@@ -29,7 +29,11 @@ sandbox:
 dataset:
   path: "dummy_data"
   size: 1000
-  seed: 42
+  # seed intentionally omitted: leaving it unset makes eval/dataset.py
+  # generate a fresh, secret, host-only seed for the held-out labels
+  # instead of a fixed/public one a candidate could replay - see
+  # eval/dataset.py:generate_split's docstring. Only set this to a fixed
+  # value for a reproducible test fixture, never for a real run.
   test_frac: 0.25
 
 eval:

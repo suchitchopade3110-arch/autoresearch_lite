@@ -1,0 +1,106 @@
+/*
+ * Hand-written, self-hosted replacement for the Tailwind Play CDN script
+ * this dashboard used to load from https://cdn.tailwindcss.com.
+ *
+ * That CDN script runs arbitrary, unpinned JavaScript (it recompiles CSS
+ * client-side on every page load, so its content is never fixed - it
+ * cannot carry a Subresource Integrity hash) on the exact page whose forms
+ * approve/reject merges. A compromised or malicious CDN response there
+ * could silently submit those forms itself. This file covers only the
+ * fixed, known set of utility classes dashboard.html actually uses, is
+ * served from this app's own origin, and never executes anything.
+ */
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: #f8fafc;      /* bg-slate-50 */
+  color: #0f172a;            /* text-slate-900 */
+  padding: 1.5rem;           /* p-6 */
+  max-width: 64rem;          /* max-w-5xl */
+  margin-left: auto;
+  margin-right: auto;        /* mx-auto */
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.grid { display: grid; }
+.grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (min-width: 768px) {
+  .md\:grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+.gap-2 { gap: 0.5rem; }
+.gap-4 { gap: 1rem; }
+
+.flex { display: flex; }
+.justify-between { justify-content: space-between; }
+.items-start { align-items: flex-start; }
+.space-y-3 > * + * { margin-top: 0.75rem; }
+
+.mx-auto { margin-left: auto; margin-right: auto; }
+.mb-1 { margin-bottom: 0.25rem; }
+.mb-2 { margin-bottom: 0.5rem; }
+.mb-3 { margin-bottom: 0.75rem; }
+.mb-6 { margin-bottom: 1.5rem; }
+.mb-8 { margin-bottom: 2rem; }
+.mt-1 { margin-top: 0.25rem; }
+
+.p-2 { padding: 0.5rem; }
+.p-4 { padding: 1rem; }
+.px-2 { padding-left: 0.5rem; padding-right: 0.5rem; }
+.px-3 { padding-left: 0.75rem; padding-right: 0.75rem; }
+.py-0\.5 { padding-top: 0.125rem; padding-bottom: 0.125rem; }
+.py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; }
+
+.rounded { border-radius: 0.25rem; }
+.rounded-lg { border-radius: 0.5rem; }
+.shadow { box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1); }
+.border-b { border-bottom: 1px solid #e2e8f0; }
+tr.last\:border-0:last-child { border-bottom: 0; }
+
+.w-full { width: 100%; }
+.max-w-5xl { max-width: 64rem; }
+.overflow-x-auto { overflow-x: auto; }
+.whitespace-pre-wrap { white-space: pre-wrap; }
+.cursor-pointer { cursor: pointer; }
+
+.text-left { text-align: left; }
+.text-xs { font-size: 0.75rem; line-height: 1rem; }
+.text-sm { font-size: 0.875rem; line-height: 1.25rem; }
+.text-lg { font-size: 1.125rem; line-height: 1.75rem; }
+.text-2xl { font-size: 1.5rem; line-height: 2rem; }
+.font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.font-medium { font-weight: 500; }
+.font-semibold { font-weight: 600; }
+.font-bold { font-weight: 700; }
+.uppercase { text-transform: uppercase; }
+
+.bg-white { background-color: #ffffff; }
+.bg-slate-50 { background-color: #f8fafc; }
+.bg-slate-100 { background-color: #f1f5f9; }
+.text-slate-400 { color: #94a3b8; }
+.text-slate-500 { color: #64748b; }
+.text-slate-600 { color: #475569; }
+.text-slate-900 { color: #0f172a; }
+
+.bg-emerald-100 { background-color: #d1fae5; }
+.text-emerald-800 { color: #065f46; }
+.bg-emerald-600 { background-color: #059669; }
+a.bg-emerald-600, button.bg-emerald-600 { color: #ffffff; }
+.hover\:bg-emerald-700:hover { background-color: #047857; }
+
+.bg-red-100 { background-color: #fee2e2; }
+.text-red-800 { color: #991b1b; }
+.bg-red-600 { background-color: #dc2626; }
+button.bg-red-600 { color: #ffffff; }
+.hover\:bg-red-700:hover { background-color: #b91c1c; }
+
+.bg-teal-100 { background-color: #ccfbf1; }
+.text-teal-800 { color: #115e59; }
+
+.bg-amber-100 { background-color: #fef3c7; }
+.text-amber-800 { color: #92400e; }
+
+.text-white { color: #ffffff; }
+
+button { border: 0; cursor: pointer; font: inherit; }
+table { border-collapse: collapse; }

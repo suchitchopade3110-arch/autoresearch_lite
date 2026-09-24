@@ -96,7 +96,10 @@ class EvolutionEngine:
             generation_usage = getattr(self.patch_generator.llm_client, "last_usage", {}) or {}
 
             error_out: List[str] = []
-            if not validate_and_apply_patch(diff, cwd=worktree_path, dry_run=True, logger=candidate_logger, error_out=error_out):
+            if not validate_and_apply_patch(
+                diff, cwd=worktree_path, dry_run=True, logger=candidate_logger, error_out=error_out,
+                allowed_files=["candidate_script.py"],
+            ):
                 last_rejection = "malformed"
                 self._last_malformed_detail = error_out[0] if error_out else ""
                 continue

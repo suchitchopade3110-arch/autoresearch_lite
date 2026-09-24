@@ -5,6 +5,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
@@ -22,6 +23,13 @@ EVOLUTION_REPORT_PATH = os.environ.get("EVOLUTION_REPORT_PATH", "evolution_repor
 
 app = FastAPI(title="Autoresearch Dashboard")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+# Serves dashboard.css - the dashboard used to load its styling from the
+# Tailwind Play CDN (https://cdn.tailwindcss.com), an unpinned third-party
+# script with no possible Subresource Integrity hash (it recompiles CSS
+# client-side, so its content is never fixed), running on the exact page
+# whose forms approve/reject merges. Self-hosting removes that dependency
+# entirely - see api/static/dashboard.css.
+app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 
 db = ExperimentDB(db_path=CHROMA_DB_PATH)
 store = ApprovalStore(db_path=APPROVAL_DB_PATH)
@@ -83,7 +91,17 @@ def dashboard(request: Request, _auth: None = Depends(require_auth)):
         {"kpis": kpis, "pending": pending, "history": history, "decided": decided, "csrf_token": csrf_token},
     )
     if not request.cookies.get("csrf_token"):
-        response.set_cookie("csrf_token", csrf_token, httponly=False, samesite="strict")
+        # httponly=True: the token is embedded directly into each form's
+        # hidden field by the server (dashboard.html) - no client-side JS
+        # ever needs to read this cookie. Leaving it JS-readable bought
+        # nothing and widened the attack surface: browser cookies aren't
+        # port-isolated, so any other localhost:* page (a malicious site
+        # the user has open, or another dev server) could otherwise plant
+        # its own csrf_token cookie value AND read this one back via JS to
+        # forge a matching form submission - a real risk in particular in
+        # the README's own DASHBOARD_AUTH_DISABLED=true mode, where there
+        # is no auth session to also bind the token to.
+        response.set_cookie("csrf_token", csrf_token, httponly=True, samesite="strict")
     return response
 
 

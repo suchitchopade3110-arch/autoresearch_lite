@@ -1,8 +1,14 @@
 import json
 import os
 import random
-from typing import Dict, List
+import secrets
+from typing import Dict, List, Optional
 
+# Used only by subset_indices()/load_subset() to pick which already-visible
+# TRAINING rows a progressive-scaling stage sees - a public, non-secret
+# constant is fine there, since it never affects the held-out labels. It is
+# NOT used by generate_split(), whose seed is security-sensitive - see
+# generate_split's docstring.
 DEFAULT_SEED = 42
 DEFAULT_N_SAMPLES = 1000
 DEFAULT_TEST_FRAC = 0.25
@@ -20,7 +26,7 @@ def _generate_rows(n_samples: int, seed: int) -> List[Dict]:
     return rows
 
 
-def generate_split(dir_path: str, n: int = DEFAULT_N_SAMPLES, seed: int = DEFAULT_SEED,
+def generate_split(dir_path: str, n: int = DEFAULT_N_SAMPLES, seed: Optional[int] = None,
                     test_frac: float = DEFAULT_TEST_FRAC) -> Dict[str, str]:
     """
     Writes a deterministic synthetic binary-classification dataset to
@@ -36,6 +42,27 @@ def generate_split(dir_path: str, n: int = DEFAULT_N_SAMPLES, seed: int = DEFAUL
     reflects real generalization rather than a printed claim. Skips
     regeneration if train.jsonl already exists, same as the old
     generate_dataset's no-clobber contract.
+
+    SECURITY: `seed` fully determines both the generated labels and the
+    train/test split - this module's own generation code is ordinary,
+    readable Python, so anyone who also knows `seed` can call
+    `_generate_rows`/this same shuffle themselves and reconstruct every
+    held-out label without ever touching truth.json. That used to be
+    exactly as bad as it sounds: the old default was the literal constant
+    42, which is public in this file's own history. Leaving `seed` unset
+    (the default, and the only setting recommended for a real run) now
+    generates a fresh, cryptographically random seed via `secrets.randbits`
+    and uses it once; it is written for the operator's own reference to
+    `<dir_path>/.generator_seed` - a path that is NEVER mounted into the
+    sandbox (sandbox/executor.py mounts train.jsonl/test.jsonl by explicit
+    name, never dir_path itself - the same reason truth.json itself stays
+    hidden, see eval/pipeline.py's top-of-file invariant). Brute-forcing a
+    63-bit seed by replaying this module against a mounted train.jsonl row
+    is computationally infeasible inside the sandbox's own CPU/time limits.
+    Pass an explicit `seed` only for a reproducible test fixture or CI
+    dataset that was never meant to resist this attack in the first place -
+    doing so in a real deployment reintroduces exactly the leak this
+    default closes.
     """
     train_path = os.path.join(dir_path, "train.jsonl")
     test_path = os.path.join(dir_path, "test.jsonl")
@@ -45,6 +72,11 @@ def generate_split(dir_path: str, n: int = DEFAULT_N_SAMPLES, seed: int = DEFAUL
         return {"train": train_path, "test": test_path, "truth": truth_path}
 
     os.makedirs(dir_path, exist_ok=True)
+
+    if seed is None:
+        seed = secrets.randbits(63)
+        with open(os.path.join(dir_path, ".generator_seed"), "w") as f:
+            f.write(f"{seed}\n")
 
     rows = _generate_rows(n, seed)
     n_test = max(1, int(len(rows) * test_frac))

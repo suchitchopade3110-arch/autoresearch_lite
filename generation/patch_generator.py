@@ -2,9 +2,10 @@ from abc import ABC, abstractmethod
 import os
 import subprocess
 import tempfile
-from typing import List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 from observability.logging_config import get_logger
+from vcs.diff_guard import validate_diff_scope
 
 _module_logger = get_logger(__name__)
 
@@ -227,7 +228,7 @@ class AnthropicClient(LLMClient):
 
 def validate_and_apply_patch(
     diff_content: str, cwd: Optional[str] = None, dry_run: bool = False, logger=None,
-    error_out: Optional[List[str]] = None,
+    error_out: Optional[List[str]] = None, allowed_files: Optional[Iterable[str]] = None,
 ) -> bool:
     """
     Validates a patch by attempting to apply it cleanly, then applies it
@@ -242,6 +243,17 @@ def validate_and_apply_patch(
     real, so checking the same diff twice would fail the second time.
     Returns True if successful, False otherwise.
 
+    allowed_files, if given, is enforced via vcs.diff_guard.validate_diff_scope
+    BEFORE the diff ever reaches `git apply`: a diff that touches any path
+    outside this set, or that creates a symlink/changes a permission bit/
+    renames/copies, is rejected outright. Every caller that applies a
+    candidate-generated diff must pass this - `git apply` itself has no
+    concept of "the caller only meant to authorize candidate_script.py" and
+    will happily create a symlink at an arbitrary path (see
+    vcs/diff_guard.py for why that matters). Omitted only by
+    _scratch_check_applies's throwaway validity probe, which never touches
+    a real worktree.
+
     error_out, if given, gets git's real failure text (e.g. "error: patch
     failed: file.py:10") appended on failure - previously this was only
     ever logged and then discarded, so every malformed-diff failure record
@@ -251,6 +263,14 @@ def validate_and_apply_patch(
     concurrently across threads and a shared/global "last error" would
     race between candidates.
     """
+    if allowed_files is not None:
+        scope_ok, scope_reason = validate_diff_scope(diff_content, allowed_files)
+        if not scope_ok:
+            (logger or _module_logger).warning(f"Patch rejected (out of scope): {scope_reason}")
+            if error_out is not None:
+                error_out.append(scope_reason)
+            return False
+
     fd, patch_file = tempfile.mkstemp(suffix=".patch")
     try:
         # newline='' disables Python's platform line-ending translation, so
@@ -329,7 +349,7 @@ class PatchGenerator:
             diffs.append(diff)
 
             error_out: List[str] = []
-            if not validate_and_apply_patch(diff, cwd=cwd, logger=log, error_out=error_out):
+            if not validate_and_apply_patch(diff, cwd=cwd, logger=log, error_out=error_out, allowed_files=target_files):
                 self.last_apply_error = error_out[0] if error_out else ""
                 return False, "\n".join(diffs)
 

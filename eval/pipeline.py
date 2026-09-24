@@ -45,6 +45,14 @@ from observability.logging_config import get_logger
 SCORE_PATTERN = re.compile(r"SCORE:\s*([-+]?\d*\.?\d+)")
 _module_logger = get_logger(__name__)
 SCORE_CLAIM_MISMATCH_THRESHOLD = 0.05
+# predictions.jsonl is written by the candidate's own code running inside
+# the sandbox - a legitimate prediction file is a few dozen bytes per test
+# row, so this is generous headroom (tens of thousands of rows), not a tight
+# fit. It exists to stop a candidate from turning the host read into a DoS:
+# without a cap, a predictions.jsonl that is either a symlink to /dev/zero
+# or just a very large regular file gets read here (host-side, outside the
+# sandbox's own memory limits) in one unbounded `for line in f` pass.
+MAX_PREDICTIONS_FILE_BYTES = 64 * 1024 * 1024
 
 
 class EvalPipeline:
@@ -58,14 +66,6 @@ class EvalPipeline:
     def __init__(self, config: Dict[str, Any]):
         self.stages = config.get('stages', [])
         self.correlation_log = []
-        # Set by evaluate_stage() for the stage just evaluated - callers
-        # that need this (see approval/gate.py's auto-approve criteria)
-        # must read it immediately after the call, the same way
-        # AnthropicClient.last_usage is read immediately after
-        # generate_diff (see generation/patch_generator.py), since this is
-        # a single shared EvalPipeline instance across every candidate and
-        # stage, not per-call state.
-        self.last_stage_flags: Dict[str, Any] = {}
 
     def score_predictions(self, pred_path: str, truth: Dict[str, int]) -> Tuple[float, str]:
         """
@@ -79,6 +79,23 @@ class EvalPipeline:
         if not os.path.exists(pred_path):
             return 0.0, "no predictions written"
 
+        # A candidate script runs inside the sandbox but still controls what
+        # ends up at this host path - a symlink to /dev/zero (or any other
+        # infinite/huge source) turns an ordinary host-side read into a
+        # denial of service, since nothing here is bound by the sandbox's
+        # own memory limits. os.path.islink is a TOCTOU check, not airtight
+        # against a concurrent swap, but the writer (the candidate's
+        # process) has already exited by the time this runs - there is no
+        # legitimate reason for that race to ever occur.
+        if os.path.islink(pred_path):
+            return 0.0, "predictions file is a symlink, refusing to read it"
+        try:
+            file_size = os.path.getsize(pred_path)
+        except OSError as e:
+            return 0.0, f"could not stat predictions file: {e}"
+        if file_size > MAX_PREDICTIONS_FILE_BYTES:
+            return 0.0, f"predictions file too large ({file_size} bytes > {MAX_PREDICTIONS_FILE_BYTES} cap)"
+
         preds: Dict[str, int] = {}
         try:
             with open(pred_path) as f:
@@ -89,6 +106,8 @@ class EvalPipeline:
                     preds[str(row["id"])] = int(row["pred"])
         except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
             return 0.0, f"malformed predictions file: {e}"
+        except OSError as e:
+            return 0.0, f"could not read predictions file: {e}"
 
         if set(preds) != set(truth):
             return 0.0, f"prediction id set mismatch ({len(preds)} vs {len(truth)})"
@@ -100,9 +119,18 @@ class EvalPipeline:
         return correct / len(truth), ""
 
     def evaluate_stage(self, execution_result: Dict[str, Any], subset_percentage: int, threshold: float,
-                        pred_path: str, truth: Dict[str, int], logger=None) -> Tuple[bool, float]:
+                        pred_path: str, truth: Dict[str, int], logger=None) -> Tuple[bool, float, bool]:
         """
-        Evaluates a single stage's real execution result. Returns (success, score).
+        Evaluates a single stage's real execution result. Returns (success,
+        score, score_claim_mismatch) - all three are returned directly,
+        never stashed on `self`, because this EvalPipeline instance is
+        shared across every candidate and stage (see evolution/scheduler.py,
+        which evaluates several candidates concurrently across threads): an
+        instance attribute set here and read by the caller "immediately
+        after" the call is exactly the kind of state that isn't actually
+        safe under concurrent calls - a second thread's call can overwrite
+        it before the first thread reads its own result back.
+
         logger defaults to a module-level logger with no run/candidate context -
         callers that have it (orchestrator/run.py, evolution/scheduler.py) should
         pass a logger already bound with candidate_id so these records can be
@@ -110,7 +138,7 @@ class EvalPipeline:
         """
         log = logger or _module_logger
         if execution_result['exit_code'] != 0 or execution_result.get('timeout', False):
-            return False, 0.0
+            return False, 0.0, False
 
         score, reason = self.score_predictions(pred_path, truth)
         if reason:
@@ -120,7 +148,6 @@ class EvalPipeline:
         mismatch = claimed is not None and abs(claimed - score) > SCORE_CLAIM_MISMATCH_THRESHOLD
         if mismatch:
             log.warning(f"score_claim_mismatch: candidate claimed SCORE={claimed:.4f}, real score={score:.4f}")
-        self.last_stage_flags = {"score_claim_mismatch": mismatch}
 
         success = score >= threshold
 
@@ -128,7 +155,7 @@ class EvalPipeline:
         if not success:
             log.info(f"Candidate failed at {subset_percentage}% subset.")
 
-        return success, score
+        return success, score, mismatch
 
     @staticmethod
     def _parse_score(execution_result: Dict[str, Any]) -> Optional[float]:

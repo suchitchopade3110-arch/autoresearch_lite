@@ -301,6 +301,57 @@ def test_gpu_access_is_granted_only_when_explicitly_configured():
         os.remove(script_path)
 
 
+def test_run_candidate_refuses_a_symlinked_script_path():
+    """
+    Defense in depth against a candidate-controlled path being a symlink -
+    os.chmod and Docker's bind-mount source resolution both follow
+    symlinks, so mounting one silently exposes whatever it points at. The
+    primary gate is vcs/diff_guard.py (which stops such a diff from ever
+    being applied); this is a second, independent check at the point the
+    mount is actually constructed. Doesn't need a real docker daemon - the
+    symlink is rejected before subprocess.run is ever called.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        real_target = os.path.join(d, "real.py")
+        with open(real_target, "w") as f:
+            f.write("print('hi')\n")
+        symlinked_script = os.path.join(d, "candidate_script.py")
+        try:
+            os.symlink(real_target, symlinked_script)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation not permitted in this environment")
+
+        with patch("sandbox.executor.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            executor = SandboxExecutor({'timeout_seconds': 10, 'cpu_limit': "0.5", 'memory_limit': "256m"})
+            with pytest.raises(ValueError, match="symlink"):
+                executor.run_candidate(symlinked_script)
+            mock_run.assert_not_called()
+
+
+def test_run_candidate_refuses_a_symlinked_out_dir():
+    with tempfile.TemporaryDirectory() as d:
+        real_dir = os.path.join(d, "real_out")
+        os.makedirs(real_dir)
+        symlinked_out_dir = os.path.join(d, "out")
+        try:
+            os.symlink(real_dir, symlinked_out_dir, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation not permitted in this environment")
+
+        with tempfile.NamedTemporaryFile(suffix='.py', delete=False) as f:
+            script_path = f.name
+        try:
+            with patch("sandbox.executor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+                executor = SandboxExecutor({'timeout_seconds': 10, 'cpu_limit': "0.5", 'memory_limit': "256m"})
+                with pytest.raises(ValueError, match="symlink"):
+                    executor.run_candidate(script_path, out_dir=symlinked_out_dir)
+                mock_run.assert_not_called()
+        finally:
+            os.remove(script_path)
+
+
 def test_run_candidate_widens_permissions_before_mounting():
     """
     Wave 4 acceptance (CI regression): a bind mount carries the HOST file's

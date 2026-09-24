@@ -82,6 +82,19 @@ class SandboxExecutor:
         start_time = time.time()
         container_name = f"sandbox-{uuid.uuid4().hex[:8]}"
 
+        # Defense in depth against a candidate-controlled path (e.g. inside
+        # a worktree) being a symlink: os.chmod and Docker's bind-mount
+        # source resolution both follow symlinks, so chmod-ing or mounting
+        # one silently operates on whatever it points at instead of the
+        # file the caller thinks it's granting sandbox access to. The real
+        # gate against a candidate ever creating such a symlink in the
+        # first place is vcs/diff_guard.py; this is a second, independent
+        # check at the point the mount is actually constructed, so a gap or
+        # future bypass in the diff guard can't silently regress this too.
+        for candidate_path in [script_path, *(extra_files or [])]:
+            if os.path.islink(candidate_path):
+                raise ValueError(f"Refusing to mount a symlink into the sandbox: {candidate_path}")
+
         # A bind mount carries the HOST file's real permission bits into the
         # container - the sandbox's UID (1000) is never the host process's
         # own UID, so a file created with a restrictive mode (e.g. 0600,
@@ -125,6 +138,8 @@ class SandboxExecutor:
             run_env.setdefault("TEST_PATH", "/app/data/test.jsonl")
 
         if out_dir:
+            if os.path.islink(out_dir):
+                raise ValueError(f"Refusing to mount a symlink into the sandbox: {out_dir}")
             os.makedirs(out_dir, exist_ok=True)
             # os.makedirs uses the process umask, typically leaving a
             # directory writable only by its owner (0755) - the sandbox's
