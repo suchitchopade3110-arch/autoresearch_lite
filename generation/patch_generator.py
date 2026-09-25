@@ -226,6 +226,79 @@ class AnthropicClient(LLMClient):
         }
         return diff
 
+
+class LocalLLMClient(LLMClient):
+    """
+    Real LLM-backed candidate generator against a local, OpenAI-compatible
+    /chat/completions endpoint (Ollama, vLLM, llama.cpp server, LM Studio,
+    ...) - no vendor SDK, just httpx (already a dependency). No API key:
+    local inference has no per-token billing, so estimated_cost_usd is
+    always 0.0 - only token counts are recorded, and only if the server
+    reports them (not every runtime does).
+
+    Same retry-on-apply-failure contract as AnthropicClient: a diff that
+    fails `git apply --check` in the scratch repo is retried with the real
+    stderr fed back into the next prompt, up to max_apply_retries times.
+    """
+    DIFF_SYSTEM_PROMPT = AnthropicClient.DIFF_SYSTEM_PROMPT
+
+    def __init__(self, base_url: str = "http://localhost:11434/v1", model: str = "qwen2.5-coder:32b",
+                 max_tokens: int = 4000, max_apply_retries: int = 3, timeout: float = 120.0):
+        import httpx
+        # base_url is joined by hand (not via httpx.Client(base_url=...)) -
+        # httpx's base_url merging follows RFC 3986 URL-join rules, so a
+        # request path starting with "/" silently DROPS a base_url path
+        # component like "/v1" instead of appending to it. Simple string
+        # concatenation has no such footgun.
+        self.base_url = base_url.rstrip("/")
+        self.client = httpx.Client(timeout=timeout)
+        self.model = model
+        self.max_tokens = max_tokens
+        self.max_apply_retries = max_apply_retries
+        # Populated after every generate_diff() call, same shape as
+        # AnthropicClient.last_usage - estimated_cost_usd is always 0.0.
+        self.last_usage = {}
+
+    def generate_diff(self, prompt: str, target_file: str, current_content: str = "") -> str:
+        feedback = ""
+        diff = ""
+        total_input = 0
+        total_output = 0
+
+        for _ in range(self.max_apply_retries):
+            user_content = f"{prompt}\n\n--- CURRENT {target_file} ---\n{current_content}"
+            if feedback:
+                user_content += f"\n\n--- PREVIOUS ATTEMPT FAILED TO APPLY (git apply --check stderr) ---\n{feedback}"
+
+            response = self.client.post(f"{self.base_url}/chat/completions", json={
+                "model": self.model,
+                "max_tokens": self.max_tokens,
+                "messages": [
+                    {"role": "system", "content": self.DIFF_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+            })
+            response.raise_for_status()
+            body = response.json()
+            usage = body.get("usage") or {}  # not every local server reports this
+            total_input += usage.get("prompt_tokens", 0)
+            total_output += usage.get("completion_tokens", 0)
+
+            diff = _strip_fences(body["choices"][0]["message"]["content"])
+
+            applies, stderr = _scratch_check_applies(target_file, current_content, diff)
+            if applies:
+                break
+            feedback = stderr
+
+        self.last_usage = {
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "estimated_cost_usd": 0.0,
+        }
+        return diff
+
+
 def validate_and_apply_patch(
     diff_content: str, cwd: Optional[str] = None, dry_run: bool = False, logger=None,
     error_out: Optional[List[str]] = None, allowed_files: Optional[Iterable[str]] = None,
