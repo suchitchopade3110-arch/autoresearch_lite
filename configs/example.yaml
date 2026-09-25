@@ -94,6 +94,11 @@ generation:
   # For client: local only -
   # model: qwen2.5-coder:32b
   # base_url: http://localhost:11434/v1
+  # How many times anthropic/local retry a git-apply failure, feeding the
+  # real error back into the next prompt, before giving up on that
+  # candidate slot - defaults to 3 if unset. A smaller/weaker local model
+  # often needs more shots to land a clean diff.
+  # max_apply_retries: 3
 
 # Human-approval gate on merges. enabled defaults to true even if this whole
 # section is removed or malformed - see approval/gate.py:resolve_approval_config.

@@ -196,12 +196,20 @@ def main():
     # local server (Ollama/vLLM/llama.cpp/...) - no key at all, cost is
     # always $0, but expect a higher malformed-diff retry rate than a
     # frontier model.
+    # max_apply_retries defaults to each client's own default (3) when
+    # unset - raise it in config for a weaker/smaller model that needs
+    # more shots to land a clean git-apply, without touching source.
+    apply_retries_kwargs = {}
+    if 'max_apply_retries' in gen_cfg:
+        apply_retries_kwargs['max_apply_retries'] = gen_cfg['max_apply_retries']
+
     if gen_cfg.get('client') == 'anthropic':
-        llm_client = AnthropicClient(model=gen_cfg.get('model', 'claude-sonnet-5'))
+        llm_client = AnthropicClient(model=gen_cfg.get('model', 'claude-sonnet-5'), **apply_retries_kwargs)
     elif gen_cfg.get('client') == 'local':
         llm_client = LocalLLMClient(
             base_url=gen_cfg.get('base_url', 'http://localhost:11434/v1'),
             model=gen_cfg.get('model', 'qwen2.5-coder:32b'),
+            **apply_retries_kwargs,
         )
     else:
         llm_client = MockLLMClient()

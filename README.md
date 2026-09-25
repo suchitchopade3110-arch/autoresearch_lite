@@ -128,7 +128,7 @@ The `--goal` string is already fully generic (it's just free text fed into the p
 
 Set `generation.client: anthropic` in your config and export `ANTHROPIC_API_KEY` - see `generation/patch_generator.py:AnthropicClient`.
 
-To run against a local model instead - no API key, no per-token cost, but expect a higher malformed-diff retry rate than a frontier model - set `generation.client: local` and point `generation.base_url` at an OpenAI-compatible `/chat/completions` endpoint (Ollama, vLLM, llama.cpp server, ...); see `generation/patch_generator.py:LocalLLMClient`. A code-tuned model (e.g. Qwen2.5-Coder, DeepSeek-Coder) will apply far more reliably than a general chat model.
+To run against a local model instead - no API key, no per-token cost, but expect a higher malformed-diff retry rate than a frontier model - set `generation.client: local` and point `generation.base_url` at an OpenAI-compatible `/chat/completions` endpoint (Ollama, vLLM, llama.cpp server, ...); see `generation/patch_generator.py:LocalLLMClient`. A code-tuned model (e.g. Qwen2.5-Coder, DeepSeek-Coder) will apply far more reliably than a general chat model. Both real clients retry a `git apply --check` failure up to `generation.max_apply_retries` times (default 3) before giving up on that candidate slot, feeding the real error back into the next prompt each time - raise it for a smaller/weaker local model that needs more shots to land a clean diff.
 
 To use a different provider, implement the `LLMClient` interface:
 

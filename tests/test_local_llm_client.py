@@ -17,8 +17,8 @@ GOOD_DIFF = "--- a/candidate_script.py\n+++ b/candidate_script.py\n@@ -1 +1 @@\n
 BAD_DIFF = "--- a/candidate_script.py\n+++ b/candidate_script.py\n@@ -1 +1,5 @@\n-\n+print(1)\n"
 
 
-def _make_client(responses):
-    client = LocalLLMClient(base_url="http://localhost:11434/v1", model="qwen2.5-coder:32b")
+def _make_client(responses, **kwargs):
+    client = LocalLLMClient(base_url="http://localhost:11434/v1", model="qwen2.5-coder:32b", **kwargs)
     client.client = MagicMock()
     client.client.post.side_effect = responses
     return client
@@ -112,3 +112,10 @@ def test_base_url_is_joined_by_hand_not_via_httpx_client_base_url():
 
 def test_local_llm_client_implements_the_llm_client_interface():
     assert issubclass(LocalLLMClient, LLMClient)
+
+
+def test_max_apply_retries_is_configurable():
+    """orchestrator/run.py wires generation.max_apply_retries through here - a value beyond the default 3 must actually raise the retry budget, not be silently capped."""
+    client = _make_client([_fake_response(BAD_DIFF)] * 5, max_apply_retries=5)
+    client.generate_diff("goal", "candidate_script.py", "\n")
+    assert client.client.post.call_count == 5
