@@ -101,6 +101,14 @@ greps) for every finding above; a dedicated pass over the REMAINING
 grep-style tests in `tests/test_reward_hacking.py` and the Chroma
 hermeticity gap is still open.
 
+## Wave 6 - close finding #17
+
+| Gap | Fix | Proving test |
+|---|---|---|
+| `test_truth_json_never_referenced_by_the_sandbox_executor` proved nothing about behavior - it grepped `sandbox/executor.py`'s source text for the word "truth", which an obfuscated/indirect reference could dodge, and which a harmless comment mentioning the filename would fail for no real reason | `sandbox/executor.py`'s mount-building logic is extracted into a new `SandboxExecutor._build_docker_cmd` (pure argument-list construction, no Docker daemon required to call it - `run_candidate` now just calls it and runs the result); `tests/test_reward_hacking.py` replaces the grep with a real behavioral test that calls it with a `truth.json` physically present next to `train.jsonl`/`test.jsonl` and inspects the actual mount arguments it returns | `tests/test_reward_hacking.py::test_truth_json_never_appears_in_the_actual_docker_mount_arguments` |
+| The repo-wide `truth.json` text sweep in the same file was documented as if it alone proved the invariant, when it's a coarse heuristic that any obfuscated path construction could defeat | Docstring rewritten to state plainly that it's defense-in-depth backing the behavioral test above, not the proof itself; no behavior change | `tests/test_reward_hacking.py::test_truth_json_absent_from_every_docker_mount_argument_repo_wide` (unchanged assertions) |
+| Every Chroma-backed test used `ExperimentDB`'s real default embedding function, which delegates to `ONNXMiniLM_L6_V2` and downloads a ~90MB model from the network on first use, caching it under `~/.cache/chroma` - on any machine without that cache already warm (a fresh CI runner, a fresh clone, an offline sandbox) the whole test suite either fails outright or becomes network-speed-dependent, and a test's pass/fail ends up depending on what happens to be sitting in a cache directory rather than on the code under test | `tests/conftest.py` adds an autouse `hermetic_chroma_embeddings` fixture that monkeypatches `chromadb.utils.embedding_functions.DefaultEmbeddingFunction` (the one factory `memory/db.py` calls) to a deterministic, offline, stdlib-only bag-of-words hashing embedding for every test in the suite - no production code change, no per-test-file change. Verified by moving `~/.cache/chroma` out of the way and re-running the full Chroma-backed subset (`test_memory.py`, `test_duplicate_checker.py`, `test_prompt_builder.py`, `test_report_generator.py`, `test_evolution_population.py`, `test_failure_diagnosis.py`, `test_energy_cost_tracking.py`): 41 passed, no network access, ~1s total | existing tests in the files listed above, now passing hermetically |
+
 ## Final verification checklist
 
 - [x] Full suite green (non-Docker): confirmed in this environment (no Docker daemon available here).
