@@ -1,6 +1,8 @@
 import json
 import os
 
+import pytest
+
 from eval.pipeline import EvalPipeline
 
 CONFIG = {"stages": [
@@ -9,6 +11,11 @@ CONFIG = {"stages": [
 ]}
 
 TRUTH = {"0": 1, "1": 0, "2": 1, "3": 0}
+
+
+def _always_score_point_five(preds, truth):
+    """A trivial stand-in for a project's own metric, used to prove eval.scorer is actually invoked."""
+    return 0.5, ""
 
 
 def make_result(stdout="", exit_code=0, timeout=False):
@@ -189,3 +196,52 @@ def test_score_predictions_reports_a_reason_on_every_zero(tmp_dir):
     mismatched_path = write_predictions(tmp_dir, [{"id": 0, "pred": 1}])
     score, reason = pipeline.score_predictions(mismatched_path, TRUTH)
     assert score == 0.0 and reason
+
+
+def test_eval_pipeline_defaults_to_binary_accuracy_scorer():
+    pipeline = EvalPipeline(CONFIG)
+    assert pipeline.scorer.__name__ == "binary_accuracy_scorer"
+
+
+def test_eval_pipeline_accepts_a_custom_scorer_via_config(tmp_dir):
+    """
+    A project with a non-classification task points eval.scorer at its
+    own "module:function" - the file-safety checks (symlink/size cap)
+    still run first regardless, only the actual scoring is pluggable.
+    """
+    pred_path = write_predictions(tmp_dir, [{"id": 0, "pred": "anything"}])
+    pipeline = EvalPipeline({**CONFIG, "scorer": "tests.test_eval_pipeline:_always_score_point_five"})
+
+    score, reason = pipeline.score_predictions(pred_path, {"0": "irrelevant-to-this-scorer"})
+
+    assert score == 0.5
+    assert reason == ""
+
+
+def test_eval_pipeline_custom_scorer_never_sees_a_symlinked_predictions_file(tmp_dir):
+    """The symlink/size-cap safety checks apply to every scorer, not just the default - a custom scorer never even gets called."""
+    real_path = write_predictions(tmp_dir, [{"id": 0, "pred": 1}])
+    symlink_path = os.path.join(tmp_dir, "symlinked_predictions.jsonl")
+    os.symlink(real_path, symlink_path)
+
+    pipeline = EvalPipeline({**CONFIG, "scorer": "tests.test_eval_pipeline:_always_score_point_five"})
+    score, reason = pipeline.score_predictions(symlink_path, TRUTH)
+
+    assert score == 0.0
+    assert "symlink" in reason
+
+
+def test_eval_pipeline_rejects_a_malformed_scorer_path_at_construction_time():
+    """Fails fast when EvalPipeline is built, not lazily on the first scored candidate."""
+    with pytest.raises(ValueError, match="module.path:function_name"):
+        EvalPipeline({**CONFIG, "scorer": "not_a_dotted_path"})
+
+
+def test_eval_pipeline_rejects_a_scorer_module_that_does_not_exist():
+    with pytest.raises(ValueError, match="could not import"):
+        EvalPipeline({**CONFIG, "scorer": "no_such_module_at_all:some_func"})
+
+
+def test_eval_pipeline_rejects_a_scorer_function_that_does_not_exist():
+    with pytest.raises(ValueError, match="no attribute"):
+        EvalPipeline({**CONFIG, "scorer": "tests.test_eval_pipeline:no_such_function"})

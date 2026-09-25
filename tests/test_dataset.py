@@ -1,7 +1,19 @@
+import json
 import os
 import tempfile
 
-from eval.dataset import generate_split, load_dataset, load_subset, load_truth, write_subset
+import pytest
+
+from eval.dataset import (
+    DatasetError,
+    generate_split,
+    load_dataset,
+    load_subset,
+    load_truth,
+    resolve_dataset,
+    validate_custom_dataset,
+    write_subset,
+)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -142,3 +154,72 @@ def test_truth_values_are_bare_labels_not_features():
         truth = load_truth(paths["truth"])
         assert len(truth) > 0
         assert all(v in (0, 1) for v in truth.values())
+
+
+def _write_custom_dataset(d, train_rows=None, test_rows=None, truth=None):
+    with open(os.path.join(d, "train.jsonl"), "w") as f:
+        for row in (train_rows or [{"feat": 1.0, "label": "a"}]):
+            f.write(json.dumps(row) + "\n")
+    with open(os.path.join(d, "test.jsonl"), "w") as f:
+        for row in (test_rows or [{"id": 0, "feat": 2.0}]):
+            f.write(json.dumps(row) + "\n")
+    with open(os.path.join(d, "truth.json"), "w") as f:
+        json.dump(truth if truth is not None else {"0": "a"}, f)
+
+
+def test_validate_custom_dataset_accepts_a_pre_existing_dataset_of_any_row_shape():
+    """
+    dataset.mode: custom is deliberately schema-agnostic at the row level -
+    a project with a non-classification task (regression, multi-class,
+    ranking, ...) doesn't have to match generate_split()'s x1/x2/label
+    shape, only supply the three expected filenames.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        _write_custom_dataset(d, train_rows=[{"features": [1, 2, 3], "y": 4.2}], truth={"0": 4.2})
+        paths = validate_custom_dataset(d)
+        assert paths == {
+            "train": os.path.join(d, "train.jsonl"),
+            "test": os.path.join(d, "test.jsonl"),
+            "truth": os.path.join(d, "truth.json"),
+        }
+
+
+def test_validate_custom_dataset_raises_a_readable_error_when_a_file_is_missing():
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "train.jsonl"), "w") as f:
+            f.write("{}\n")
+        # test.jsonl and truth.json deliberately absent
+        with pytest.raises(DatasetError, match="test.jsonl.*truth.json"):
+            validate_custom_dataset(d)
+
+
+def test_validate_custom_dataset_raises_on_invalid_truth_json():
+    with tempfile.TemporaryDirectory() as d:
+        _write_custom_dataset(d)
+        with open(os.path.join(d, "truth.json"), "w") as f:
+            f.write("not valid json")
+        with pytest.raises(DatasetError, match="not valid JSON"):
+            validate_custom_dataset(d)
+
+
+def test_resolve_dataset_dispatches_synthetic_by_default():
+    with tempfile.TemporaryDirectory() as d:
+        paths = resolve_dataset(d, n=20, seed=1)
+        train_rows = load_dataset(paths["train"])
+        assert set(train_rows[0].keys()) == {"x1", "x2", "label"}
+
+
+def test_resolve_dataset_dispatches_custom_and_ignores_synthetic_only_kwargs():
+    with tempfile.TemporaryDirectory() as d:
+        _write_custom_dataset(d)
+        # n/seed/test_frac are synthetic-only and must be silently ignored,
+        # not passed through to validate_custom_dataset (which doesn't
+        # accept them).
+        paths = resolve_dataset(d, mode="custom", n=999, seed=1, test_frac=0.9)
+        assert paths["train"] == os.path.join(d, "train.jsonl")
+
+
+def test_resolve_dataset_rejects_an_unrecognized_mode():
+    with tempfile.TemporaryDirectory() as d:
+        with pytest.raises(DatasetError, match="synthetic.*custom"):
+            resolve_dataset(d, mode="something-else")

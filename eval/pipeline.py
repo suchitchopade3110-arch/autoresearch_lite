@@ -23,7 +23,7 @@
 # Both properties are enforced by permanent regression tests that must
 # never be deleted, skipped, or weakened:
 #   - tests/test_reward_hacking.py::test_printed_score_claim_is_never_trusted
-#   - tests/test_reward_hacking.py::test_truth_json_never_referenced_by_the_sandbox_executor
+#   - tests/test_reward_hacking.py::test_truth_json_never_appears_in_the_actual_docker_mount_arguments
 #   - tests/test_reward_hacking.py::test_truth_json_absent_from_every_docker_mount_argument_repo_wide
 #   - tests/test_sandbox.py::test_truth_json_unreachable_by_any_path_inside_the_sandbox
 #     (walks the ENTIRE container filesystem for a file literally named
@@ -35,10 +35,11 @@
 # re-run every test above first.
 # =============================================================================
 
+import importlib
 import json
 import os
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from observability.logging_config import get_logger
 
@@ -54,6 +55,93 @@ SCORE_CLAIM_MISMATCH_THRESHOLD = 0.05
 # sandbox's own memory limits) in one unbounded `for line in f` pass.
 MAX_PREDICTIONS_FILE_BYTES = 64 * 1024 * 1024
 
+Scorer = Callable[[Dict[str, Any], Dict[str, Any]], Tuple[float, str]]
+
+
+def load_predictions(pred_path: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Loads predictions.jsonl into an id -> raw prediction value dict,
+    enforcing the security checks that must hold regardless of task or
+    scorer: never a symlink, never over the size cap, must actually parse.
+    Returns (preds, reason) - preds is None on any failure, with reason
+    explaining why (the caller scores 0.0 in that case). Deliberately does
+    NOT constrain what a prediction value IS (int/float/str) or check it
+    against truth's id set - that's the scorer's job, since it varies by
+    task (see binary_accuracy_scorer below for the built-in one).
+    """
+    if not os.path.exists(pred_path):
+        return None, "no predictions written"
+
+    # A candidate script runs inside the sandbox but still controls what
+    # ends up at this host path - a symlink to /dev/zero (or any other
+    # infinite/huge source) turns an ordinary host-side read into a
+    # denial of service, since nothing here is bound by the sandbox's
+    # own memory limits. os.path.islink is a TOCTOU check, not airtight
+    # against a concurrent swap, but the writer (the candidate's
+    # process) has already exited by the time this runs - there is no
+    # legitimate reason for that race to ever occur.
+    if os.path.islink(pred_path):
+        return None, "predictions file is a symlink, refusing to read it"
+    try:
+        file_size = os.path.getsize(pred_path)
+    except OSError as e:
+        return None, f"could not stat predictions file: {e}"
+    if file_size > MAX_PREDICTIONS_FILE_BYTES:
+        return None, f"predictions file too large ({file_size} bytes > {MAX_PREDICTIONS_FILE_BYTES} cap)"
+
+    preds: Dict[str, Any] = {}
+    try:
+        with open(pred_path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                preds[str(row["id"])] = row["pred"]
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        return None, f"malformed predictions file: {e}"
+    except OSError as e:
+        return None, f"could not read predictions file: {e}"
+
+    return preds, ""
+
+
+def binary_accuracy_scorer(preds: Dict[str, Any], truth: Dict[str, int]) -> Tuple[float, str]:
+    """
+    Default scorer, unchanged from the original hardcoded behavior:
+    predictions must exactly cover truth's id set and be 0/1, scored as
+    plain accuracy. A project with a different task (regression, ranking,
+    multi-class, ...) sets eval.scorer to its own "module:function"
+    implementing this same (preds, truth) -> (score, reason) contract.
+    """
+    if set(preds) != set(truth):
+        return 0.0, f"prediction id set mismatch ({len(preds)} vs {len(truth)})"
+
+    try:
+        preds_int = {k: int(v) for k, v in preds.items()}
+    except (TypeError, ValueError):
+        return 0.0, "predictions must be 0 or 1"
+
+    if not all(v in (0, 1) for v in preds_int.values()):
+        return 0.0, "predictions must be 0 or 1"
+
+    correct = sum(1 for i, y in truth.items() if preds_int[i] == y)
+    return correct / len(truth), ""
+
+
+def _load_scorer(dotted_path: str) -> Scorer:
+    """Resolves eval.scorer ("module.path:function_name") to a callable - fails at construction time, not mid-run, on a bad path."""
+    module_name, sep, func_name = dotted_path.partition(":")
+    if not sep:
+        raise ValueError(f"eval.scorer must be 'module.path:function_name', got {dotted_path!r}")
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as e:
+        raise ValueError(f"eval.scorer: could not import {module_name!r}: {e}")
+    try:
+        return getattr(module, func_name)
+    except AttributeError:
+        raise ValueError(f"eval.scorer: {module_name!r} has no attribute {func_name!r}")
+
 
 class EvalPipeline:
     """
@@ -66,57 +154,26 @@ class EvalPipeline:
     def __init__(self, config: Dict[str, Any]):
         self.stages = config.get('stages', [])
         self.correlation_log = []
+        # Pluggable per-task scoring (see eval.scorer in configs/example.yaml) -
+        # defaults to the built-in binary-accuracy behavior, unchanged from
+        # before this was pluggable. The file-safety checks in
+        # load_predictions() are NOT part of the plugin surface - every
+        # scorer gets predictions that already passed them.
+        self.scorer: Scorer = _load_scorer(config.get('scorer', 'eval.pipeline:binary_accuracy_scorer'))
 
     def score_predictions(self, pred_path: str, truth: Dict[str, int]) -> Tuple[float, str]:
         """
         Scores predictions written by the candidate against held-out
-        truth. Returns (score, reason) - reason is "" on a clean score,
-        otherwise a human-readable explanation of why the score is 0.0.
-        Never raises: a missing file, malformed JSON, a wrong id set, or a
-        non-0/1 prediction all score 0.0 with a reason instead of an
-        exception escaping to the caller.
+        truth, via self.scorer. Returns (score, reason) - reason is "" on
+        a clean score, otherwise a human-readable explanation of why the
+        score is 0.0. Never raises: a missing file, malformed JSON, or
+        anything the scorer itself rejects all score 0.0 with a reason
+        instead of an exception escaping to the caller.
         """
-        if not os.path.exists(pred_path):
-            return 0.0, "no predictions written"
-
-        # A candidate script runs inside the sandbox but still controls what
-        # ends up at this host path - a symlink to /dev/zero (or any other
-        # infinite/huge source) turns an ordinary host-side read into a
-        # denial of service, since nothing here is bound by the sandbox's
-        # own memory limits. os.path.islink is a TOCTOU check, not airtight
-        # against a concurrent swap, but the writer (the candidate's
-        # process) has already exited by the time this runs - there is no
-        # legitimate reason for that race to ever occur.
-        if os.path.islink(pred_path):
-            return 0.0, "predictions file is a symlink, refusing to read it"
-        try:
-            file_size = os.path.getsize(pred_path)
-        except OSError as e:
-            return 0.0, f"could not stat predictions file: {e}"
-        if file_size > MAX_PREDICTIONS_FILE_BYTES:
-            return 0.0, f"predictions file too large ({file_size} bytes > {MAX_PREDICTIONS_FILE_BYTES} cap)"
-
-        preds: Dict[str, int] = {}
-        try:
-            with open(pred_path) as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    row = json.loads(line)
-                    preds[str(row["id"])] = int(row["pred"])
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
-            return 0.0, f"malformed predictions file: {e}"
-        except OSError as e:
-            return 0.0, f"could not read predictions file: {e}"
-
-        if set(preds) != set(truth):
-            return 0.0, f"prediction id set mismatch ({len(preds)} vs {len(truth)})"
-
-        if not all(v in (0, 1) for v in preds.values()):
-            return 0.0, "predictions must be 0 or 1"
-
-        correct = sum(1 for i, y in truth.items() if preds[i] == y)
-        return correct / len(truth), ""
+        preds, reason = load_predictions(pred_path)
+        if preds is None:
+            return 0.0, reason
+        return self.scorer(preds, truth)
 
     def evaluate_stage(self, execution_result: Dict[str, Any], subset_percentage: int, threshold: float,
                         pred_path: str, truth: Dict[str, int], logger=None) -> Tuple[bool, float, bool]:

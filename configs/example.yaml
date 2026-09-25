@@ -27,6 +27,12 @@ sandbox:
   # gpus: "all"
 
 dataset:
+  # "synthetic" (default) generates the built-in demo dataset. "custom"
+  # skips generation entirely and requires train.jsonl/test.jsonl/
+  # truth.json to already exist at `path` (any row shape - see
+  # eval/dataset.py:validate_custom_dataset and README's "Bring your own
+  # project"). size/seed/test_frac below only apply to "synthetic".
+  mode: synthetic
   path: "dummy_data"
   size: 1000
   # seed intentionally omitted: leaving it unset makes eval/dataset.py
@@ -50,6 +56,11 @@ eval:
   # score >= threshold - see eval/baseline.py.
   min_improvement: 0.001
   state_path: "state.json"
+  # Dotted "module:function" implementing (preds, truth) -> (score, reason) -
+  # defaults to the built-in binary-accuracy scorer. Only meaningful to
+  # change alongside dataset.mode: custom - see README's "Bring your own
+  # project".
+  # scorer: "your_module.scoring:score"
 
 # Sequential mode only (--mode sequential, the default)
 orchestrator:
