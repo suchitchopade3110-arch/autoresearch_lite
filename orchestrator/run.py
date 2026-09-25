@@ -10,7 +10,7 @@ from config_schema import ConfigError, load_config
 from observability.logging_config import bind, configure_logging, get_logger
 from vcs.git_controller import GitController, MergeConflict
 from sandbox.executor import SandboxExecutor
-from eval.dataset import generate_split, load_truth, write_subset
+from eval.dataset import DatasetError, load_truth, resolve_dataset, write_subset
 from eval.baseline import BaselineStore
 from eval.pipeline import EvalPipeline
 from orchestrator.metrics import calculate_all_metrics
@@ -146,13 +146,20 @@ def main():
     # seed (see eval/dataset.py's docstring for why a fixed/public seed lets
     # a candidate regenerate the held-out labels without ever touching
     # truth.json). Only set dataset.seed in config for a reproducible test
-    # fixture, never for a real run.
-    dataset_paths = generate_split(
-        dataset_dir,
-        n=dataset_cfg.get('size', 1000),
-        seed=dataset_cfg.get('seed'),
-        test_frac=dataset_cfg.get('test_frac', 0.25),
-    )
+    # fixture, never for a real run. dataset.mode: "custom" skips
+    # generation entirely and validates an operator-supplied train.jsonl/
+    # test.jsonl/truth.json instead - see eval/dataset.py:resolve_dataset.
+    try:
+        dataset_paths = resolve_dataset(
+            dataset_dir,
+            mode=dataset_cfg.get('mode', 'synthetic'),
+            n=dataset_cfg.get('size', 1000),
+            seed=dataset_cfg.get('seed'),
+            test_frac=dataset_cfg.get('test_frac', 0.25),
+        )
+    except DatasetError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
     # truth.json is loaded host-side only - it is never mounted into the
     # sandbox (see sandbox/executor.py), so a candidate can never read its
     # own answer key off disk.
