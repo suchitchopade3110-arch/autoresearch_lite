@@ -370,6 +370,7 @@ def test_run_candidate_refuses_a_symlinked_script_path():
         with patch("sandbox.executor.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             executor = SandboxExecutor({'timeout_seconds': 10, 'cpu_limit': "0.5", 'memory_limit': "256m"})
+            mock_run.reset_mock()  # constructing the executor legitimately calls `docker build`
             with pytest.raises(ValueError, match="symlink"):
                 executor.run_candidate(symlinked_script)
             mock_run.assert_not_called()
@@ -391,6 +392,7 @@ def test_run_candidate_refuses_a_symlinked_out_dir():
             with patch("sandbox.executor.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
                 executor = SandboxExecutor({'timeout_seconds': 10, 'cpu_limit': "0.5", 'memory_limit': "256m"})
+                mock_run.reset_mock()  # constructing the executor legitimately calls `docker build`
                 with pytest.raises(ValueError, match="symlink"):
                     executor.run_candidate(script_path, out_dir=symlinked_out_dir)
                 mock_run.assert_not_called()

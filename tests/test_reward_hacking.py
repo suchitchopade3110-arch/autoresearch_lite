@@ -2,8 +2,10 @@ import json
 import os
 import subprocess
 import sys
+from unittest.mock import patch
 
 from eval.pipeline import EvalPipeline
+from sandbox.executor import SandboxExecutor
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -54,26 +56,65 @@ def test_partial_prediction_coverage_gets_no_partial_credit(tmp_dir):
     assert reason
 
 
-def test_truth_json_never_referenced_by_the_sandbox_executor():
+def test_truth_json_never_appears_in_the_actual_docker_mount_arguments(tmp_dir):
     """
-    Permanent regression test - must never be deleted or skipped. The
-    sandbox executor builds every `docker run -v ...` mount argument; if it
-    never mentions the held-out labels file by name, it is structurally
-    incapable of mounting it into a candidate's container.
+    Permanent regression test - must never be deleted or skipped. Exercises
+    the real code path that decides what gets bind-mounted into a
+    candidate's container - SandboxExecutor._build_docker_cmd - with a
+    truth.json physically sitting right next to train.jsonl/test.jsonl, and
+    inspects the actual argument list Docker would receive.
+
+    This replaces a prior version of this test that only grepped
+    sandbox/executor.py's source text for the word "truth". A source grep
+    proves nothing about behavior: code can reference the held-out file
+    indirectly (a concatenated string, a variable read from elsewhere) and
+    still pass a text scan, and a harmless comment mentioning the filename
+    (like this file's own docstrings) would fail one for no real reason.
+    Calling the real mount-building method and inspecting its real output
+    is the only thing that actually proves the invariant. No Docker daemon
+    is required - _build_docker_cmd only assembles the argument list, it
+    never invokes Docker (see sandbox/executor.py).
     """
-    executor_path = os.path.join(REPO_ROOT, "sandbox", "executor.py")
-    with open(executor_path) as f:
-        content = f.read()
-    assert "truth" not in content.lower()
+    for name, content in (
+        ("train.jsonl", json.dumps({"x1": 1.0, "label": 1}) + "\n"),
+        ("test.jsonl", json.dumps({"id": 0, "x1": 0.2}) + "\n"),
+        ("truth.json", json.dumps({"0": 1})),
+    ):
+        with open(os.path.join(tmp_dir, name), "w") as f:
+            f.write(content)
+
+    script_path = os.path.join(tmp_dir, "candidate_script.py")
+    with open(script_path, "w") as f:
+        f.write("print('hi')\n")
+
+    config = {"timeout_seconds": 10, "cpu_limit": "0.5", "memory_limit": "256m"}
+    with patch.object(SandboxExecutor, "_build_image"):  # no Docker daemon needed for this test
+        executor = SandboxExecutor(config, dataset_dir=tmp_dir)
+
+    cmd = executor._build_docker_cmd(script_path, "sandbox-test")
+
+    assert not any("truth" in arg.lower() for arg in cmd), cmd
+    # Sanity: the mount-building path really ran with dataset_dir wired up,
+    # so the assertion above isn't vacuously true - train/test really were
+    # mounted, truth.json just never was.
+    assert any("train.jsonl" in arg for arg in cmd)
+    assert any("test.jsonl" in arg for arg in cmd)
 
 
 def test_truth_json_absent_from_every_docker_mount_argument_repo_wide():
     """
-    Belt-and-suspenders sweep: scan the whole repo (excluding this test file
-    and test_sandbox.py, which legitimately reference truth.json to prove
-    it's NOT visible in-container) for truth.json appearing near a
-    mount/docker construct. Pure Python, not a shelled-out grep - grep
-    isn't guaranteed to exist (e.g. on Windows).
+    Heuristic defense-in-depth, NOT the proof of the invariant (that's
+    test_truth_json_never_appears_in_the_actual_docker_mount_arguments
+    above, which exercises real behavior). This is a coarse repo-wide text
+    sweep: it scans every .py file (excluding this test file and
+    test_sandbox.py, which legitimately reference truth.json to prove it's
+    NOT visible in-container) for the string "truth.json" appearing near a
+    mount/docker construct. It exists only to catch an accidental mount
+    added somewhere OTHER than sandbox/executor.py that the behavioral test
+    above wouldn't be looking at - it can still be defeated by an obfuscated
+    path (string concatenation, an indirect variable) the same way any text
+    scan can. Pure Python, not a shelled-out grep - grep isn't guaranteed to
+    exist (e.g. on Windows).
     """
     excluded = {"test_reward_hacking.py", "test_sandbox.py"}
     offending = []
