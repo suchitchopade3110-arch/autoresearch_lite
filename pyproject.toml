@@ -7,8 +7,25 @@ name = "autoresearch-lite"
 version = "0.1.0"
 description = "An autonomous ML research agent loop: propose, sandbox-evaluate, and merge or roll back candidate patches, with human approval and RAG-style memory."
 readme = "README.md"
-license = { file = "LICENSE" }
+# SPDX string, not the deprecated `{ file = "LICENSE" }` table form -
+# setuptools warns the table form stops being supported 2027-02-18.
+license = "MIT"
 requires-python = ">=3.9"
+authors = [
+    { name = "Suchit Sachin Chopade" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Build Tools",
+]
 dependencies = [
     "GitPython>=3.1",
     "PyYAML>=6.0",
@@ -21,6 +38,11 @@ dependencies = [
     "python-multipart>=0.0.9",
     "anthropic>=0.119",
 ]
+
+[project.urls]
+Homepage = "https://github.com/suchitchopade3110-arch/autoresearch_lite"
+Repository = "https://github.com/suchitchopade3110-arch/autoresearch_lite"
+Issues = "https://github.com/suchitchopade3110-arch/autoresearch_lite/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
@@ -45,3 +67,13 @@ include = [
     "sandbox*",
     "vcs*",
 ]
+
+[tool.setuptools.package-data]
+# Non-.py files setuptools.packages.find never picks up on its own - the
+# dashboard's HTML/CSS (api/main.py already resolves both via
+# os.path.dirname(__file__), not CWD, so bundling is the only thing
+# missing) and the sandbox image's build context (Dockerfile +
+# requirements-sandbox.txt - see sandbox/executor.py's _build_image,
+# which resolves this same directory via __file__ rather than CWD too).
+api = ["templates/*.html", "static/*.css"]
+sandbox = ["Dockerfile", "requirements-sandbox.txt"]
