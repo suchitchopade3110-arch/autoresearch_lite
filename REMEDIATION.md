@@ -112,7 +112,7 @@ hermeticity gap is still open.
 ## Final verification checklist
 
 - [x] Full suite green (non-Docker): confirmed in this environment (no Docker daemon available here).
-- [ ] Full suite green including Docker: requires a machine with Docker running - verify with `pytest -q`.
+- [x] Full suite green including Docker: confirmed in CI (GitHub Actions runners have a native Docker daemon, no Docker-Desktop-VM file-sharing restriction) - `.github/workflows/tests.yml` run `8e25569` passed in full, including `tests/test_sandbox.py` and both `tests/test_integration*.py` end-to-end loops.
 - [x] `tests/test_reward_hacking.py` (the reward-hacking canary) still passes.
 - [x] `git grep truth.json -- '*.py'` shows no occurrence inside a Docker mount argument (`-v ...`) - only host-side loading code.
 - [x] A deliberately injected mid-run conflict leaves the repo clean: `tests/test_vcs.py::test_second_conflicting_merge_raises_and_leaves_the_main_checkout_clean` constructs exactly this (two candidates editing the same line) and asserts no `MERGE_HEAD`, no dirty working tree.

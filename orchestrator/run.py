@@ -19,7 +19,7 @@ from orchestrator.metrics import calculate_all_metrics
 from memory.db import ExperimentDB
 from memory.failure_analysis import analyze_failure
 from generation.prompt_builder import PromptBuilder
-from generation.patch_generator import PatchGenerator, MockLLMClient, AnthropicClient
+from generation.patch_generator import PatchGenerator, MockLLMClient, AnthropicClient, LocalLLMClient
 from generation.static_check import check_syntax_multi
 
 # Phase 4 imports
@@ -183,11 +183,19 @@ def main():
     gen_cfg = config.get('generation', {})
     prompt_builder = PromptBuilder(db, gen_cfg)
     # generation.client defaults to "mock" so the test suite needs no
-    # network access or API key. Only "anthropic" reads ANTHROPIC_API_KEY
-    # (via the SDK's own env lookup) - never from config, so a committed
-    # config file can never leak a key.
+    # network access or API key. "anthropic" reads ANTHROPIC_API_KEY (via
+    # the SDK's own env lookup) - never from config, so a committed config
+    # file can never leak a key. "local" talks to an OpenAI-compatible
+    # local server (Ollama/vLLM/llama.cpp/...) - no key at all, cost is
+    # always $0, but expect a higher malformed-diff retry rate than a
+    # frontier model.
     if gen_cfg.get('client') == 'anthropic':
         llm_client = AnthropicClient(model=gen_cfg.get('model', 'claude-sonnet-5'))
+    elif gen_cfg.get('client') == 'local':
+        llm_client = LocalLLMClient(
+            base_url=gen_cfg.get('base_url', 'http://localhost:11434/v1'),
+            model=gen_cfg.get('model', 'qwen2.5-coder:32b'),
+        )
     else:
         llm_client = MockLLMClient()
     patch_generator = PatchGenerator(llm_client)
@@ -250,8 +258,8 @@ def main():
         apply_success, diff = patch_generator.generate_and_apply(
             prompt, target_files, cwd=worktree_path, logger=candidate_logger
         )
-        # Only AnthropicClient sets this - MockLLMClient makes no API calls,
-        # so there's no cost to attribute.
+        # Only AnthropicClient/LocalLLMClient set this - MockLLMClient makes
+        # no API calls, so there's no cost/tokens to attribute.
         generation_usage = getattr(patch_generator.llm_client, "last_usage", {}) or {}
 
         if not apply_success:

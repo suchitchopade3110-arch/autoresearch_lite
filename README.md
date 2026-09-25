@@ -23,13 +23,13 @@ An autonomous ML research agent loop: propose a candidate (as a diff), apply and
 - **Experiment Memory (RAG) (`memory/db.py`):** a local ChromaDB instance storing hypotheses, diffs, outcomes, metrics, and rationale per experiment (cosine distance, so `evolution/duplicate_checker.py`'s similarity threshold is meaningful). An exact-diff repeat is caught via a cheap metadata lookup (`has_exact_diff`) before paying for an embedding + nearest-neighbor search.
 - **Failure Analysis (`memory/failure_analysis.py`):** categorizes failures (syntax, runtime, timeout, resource-limit, metric-regression).
 - **Prompt Builder (`generation/prompt_builder.py`):** retrieves past successes/failures from memory into the next prompt.
-- **Patch Generation (`generation/patch_generator.py`):** validates and applies unified diffs against `LLMClient.generate_diff(prompt, target_file, current_content)` - every call includes the target file's real current content, so a real model writes a diff against what's actually there rather than a stale assumption. Two implementations: `MockLLMClient` (default, no network/key needed - always implements the same honest baseline solution) and `AnthropicClient` (`generation.client: anthropic` in config; reads `ANTHROPIC_API_KEY` from the environment, never from config). `AnthropicClient` retries up to 3 times on a `git apply --check` failure, feeding the actual stderr back into the next prompt, and records `input_tokens`/`output_tokens`/`estimated_cost_usd` into every candidate's metrics and the end-of-run report.
+- **Patch Generation (`generation/patch_generator.py`):** validates and applies unified diffs against `LLMClient.generate_diff(prompt, target_file, current_content)` - every call includes the target file's real current content, so a real model writes a diff against what's actually there rather than a stale assumption. Three implementations: `MockLLMClient` (default, no network/key needed - always implements the same honest baseline solution), `AnthropicClient` (`generation.client: anthropic` in config; reads `ANTHROPIC_API_KEY` from the environment, never from config), and `LocalLLMClient` (`generation.client: local`; talks to an OpenAI-compatible local server - Ollama, vLLM, llama.cpp, ... - via `generation.base_url`, no key needed). Both real clients retry up to 3 times on a `git apply --check` failure, feeding the actual stderr back into the next prompt, and record `input_tokens`/`output_tokens`/`estimated_cost_usd` into every candidate's metrics and the end-of-run report (`estimated_cost_usd` is always `0.0` for `LocalLLMClient` - local inference has no per-token billing).
 - **Static Analysis Pre-check (`generation/static_check.py`):** rejects malformed/invalid syntax before sandbox execution.
 - **Multi-objective scoring (`evolution/scoring.py`):** a candidate's real evaluation score drives selection, and a failed candidate can never outrank a successful one under either scoring strategy regardless of how fast it failed.
 
 ## What's NOT implemented yet
 
-- **`MockLLMClient` always returns the same diff regardless of prompt/history.** This is deliberate - it's the zero-setup default with no network or API key needed, not a bug. Set `generation.client: anthropic` for a real, context-aware model.
+- **`MockLLMClient` always returns the same diff regardless of prompt/history.** This is deliberate - it's the zero-setup default with no network or API key needed, not a bug. Set `generation.client: anthropic` or `generation.client: local` for a real, context-aware model.
 - **Carbon-footprint methodology.** `energy_estimate` is `execution_time * energy_watts_constant` (an arbitrary multiplier, default 10.0), not a real methodology like CodeCarbon or a grid-intensity constant - it's a placeholder signal for relative comparison between candidates, not an absolute measurement.
 
 ## Security Disclaimer
@@ -100,7 +100,11 @@ By default, `target.repo_path` is `.` - candidates are generated directly into t
 
 ### Swapping in a real LLM
 
-Set `generation.client: anthropic` in your config and export `ANTHROPIC_API_KEY` - see `generation/patch_generator.py:AnthropicClient`. To use a different provider, implement the `LLMClient` interface:
+Set `generation.client: anthropic` in your config and export `ANTHROPIC_API_KEY` - see `generation/patch_generator.py:AnthropicClient`.
+
+To run against a local model instead - no API key, no per-token cost, but expect a higher malformed-diff retry rate than a frontier model - set `generation.client: local` and point `generation.base_url` at an OpenAI-compatible `/chat/completions` endpoint (Ollama, vLLM, llama.cpp server, ...); see `generation/patch_generator.py:LocalLLMClient`. A code-tuned model (e.g. Qwen2.5-Coder, DeepSeek-Coder) will apply far more reliably than a general chat model.
+
+To use a different provider, implement the `LLMClient` interface:
 
 ```python
 class MyRealLLMClient(LLMClient):
