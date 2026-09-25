@@ -62,8 +62,15 @@ class SandboxExecutor:
         self._build_image()
 
     def _build_image(self):
+        # Resolved relative to this file, not the caller's CWD - a
+        # pip-installed `autoresearch` is invoked from whatever directory
+        # the operator happens to be in, which has no reason to contain a
+        # sandbox/Dockerfile of its own. This directory (Dockerfile +
+        # requirements-sandbox.txt) is bundled as package data - see
+        # pyproject.toml's [tool.setuptools.package-data].
+        sandbox_dir = os.path.dirname(os.path.abspath(__file__))
         subprocess.run(
-            ["docker", "build", "-t", "ml-sandbox", "-f", "sandbox/Dockerfile", "sandbox/"],
+            ["docker", "build", "-t", "ml-sandbox", "-f", os.path.join(sandbox_dir, "Dockerfile"), sandbox_dir],
             check=True,
             capture_output=True
         )
