@@ -27,6 +27,12 @@ sandbox:
   # gpus: "all"
 
 dataset:
+  # "synthetic" (default) generates the built-in demo dataset. "custom"
+  # skips generation entirely and requires train.jsonl/test.jsonl/
+  # truth.json to already exist at `path` (any row shape - see
+  # eval/dataset.py:validate_custom_dataset and README's "Bring your own
+  # project"). size/seed/test_frac below only apply to "synthetic".
+  mode: synthetic
   path: "dummy_data"
   size: 1000
   # seed intentionally omitted: leaving it unset makes eval/dataset.py
@@ -50,6 +56,11 @@ eval:
   # score >= threshold - see eval/baseline.py.
   min_improvement: 0.001
   state_path: "state.json"
+  # Dotted "module:function" implementing (preds, truth) -> (score, reason) -
+  # defaults to the built-in binary-accuracy scorer. Only meaningful to
+  # change alongside dataset.mode: custom - see README's "Bring your own
+  # project".
+  # scorer: "your_module.scoring:score"
 
 # Sequential mode only (--mode sequential, the default)
 orchestrator:
@@ -74,9 +85,20 @@ generation:
   # "mock" (default) needs no network or API key - MockLLMClient always
   # implements the same honest baseline solution. "anthropic" calls the
   # real Claude API (ANTHROPIC_API_KEY from the environment, never from
-  # this file) - see generation/patch_generator.py:AnthropicClient.
+  # this file) - see generation/patch_generator.py:AnthropicClient. "local"
+  # calls an OpenAI-compatible local server (Ollama/vLLM/llama.cpp/...) -
+  # no key, no cost, but a weaker model means more malformed-diff retries -
+  # see generation/patch_generator.py:LocalLLMClient.
   client: mock
   # model: claude-sonnet-5
+  # For client: local only -
+  # model: qwen2.5-coder:32b
+  # base_url: http://localhost:11434/v1
+  # How many times anthropic/local retry a git-apply failure, feeding the
+  # real error back into the next prompt, before giving up on that
+  # candidate slot - defaults to 3 if unset. A smaller/weaker local model
+  # often needs more shots to land a clean diff.
+  # max_apply_retries: 3
 
 # Human-approval gate on merges. enabled defaults to true even if this whole
 # section is removed or malformed - see approval/gate.py:resolve_approval_config.

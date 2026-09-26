@@ -19,9 +19,9 @@ GOOD_DIFF = "--- a/candidate_script.py\n+++ b/candidate_script.py\n@@ -1 +1 @@\n
 BAD_DIFF = "--- a/candidate_script.py\n+++ b/candidate_script.py\n@@ -1 +1,5 @@\n-\n+print(1)\n"
 
 
-def _make_client(monkeypatch, responses):
+def _make_client(monkeypatch, responses, **kwargs):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-not-real")
-    client = AnthropicClient(model="claude-sonnet-5")
+    client = AnthropicClient(model="claude-sonnet-5", **kwargs)
     client.client = MagicMock()
     client.client.messages.create.side_effect = responses
     return client
@@ -104,3 +104,10 @@ def test_temperature_is_never_sent(monkeypatch):
 
 def test_anthropic_client_implements_the_llm_client_interface():
     assert issubclass(AnthropicClient, LLMClient)
+
+
+def test_max_apply_retries_is_configurable(monkeypatch):
+    """orchestrator/run.py wires generation.max_apply_retries through here - a value beyond the default 3 must actually raise the retry budget, not be silently capped."""
+    client = _make_client(monkeypatch, [_fake_message(BAD_DIFF)] * 5, max_apply_retries=5)
+    client.generate_diff("goal", "candidate_script.py", "\n")
+    assert client.client.messages.create.call_count == 5

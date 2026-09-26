@@ -183,6 +183,16 @@ class EvolutionEngine:
         }
 
     def _select_parents(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # A generation can legitimately produce zero candidates - every slot
+        # exhausted its malformed-diff or duplicate retries (a real,
+        # observed outcome with a weaker/smaller LLM, not just a
+        # theoretical edge case). Without this guard, 'tournament' below
+        # calls max() on an empty sample and crashes the whole run instead
+        # of just falling back to ordinary (non-mutated) generation for the
+        # next round - see run()'s `if mutation_source:` check.
+        if not candidates:
+            return []
+
         strategy = self.config.get('selection_strategy', 'tournament')
 
         sorted_cands = sorted(candidates, key=lambda x: x.get('composite_score', -float('inf')), reverse=True)

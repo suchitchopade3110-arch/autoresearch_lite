@@ -61,8 +61,10 @@ def compute_kpis(db, approval_store=None, evolution_report_path: str = EVOLUTION
         total_compute_seconds / success_count if success_count else None
     )
 
-    # Only populated by AnthropicClient (see generation/patch_generator.py) -
-    # MockLLMClient makes no API calls, so this is 0.0 for every mock run.
+    # Only populated by AnthropicClient/LocalLLMClient (see
+    # generation/patch_generator.py) - MockLLMClient makes no API calls, so
+    # this is 0.0 for every mock run (as is estimated_cost_usd for every
+    # LocalLLMClient run - local inference has no per-token billing).
     # Summed once, here, over each experiment's own single recorded cost -
     # nothing else in this module or the dashboard re-aggregates it, so
     # this total is never double-counted.

@@ -62,8 +62,15 @@ class SandboxExecutor:
         self._build_image()
 
     def _build_image(self):
+        # Resolved relative to this file, not the caller's CWD - a
+        # pip-installed `autoresearch` is invoked from whatever directory
+        # the operator happens to be in, which has no reason to contain a
+        # sandbox/Dockerfile of its own. This directory (Dockerfile +
+        # requirements-sandbox.txt) is bundled as package data - see
+        # pyproject.toml's [tool.setuptools.package-data].
+        sandbox_dir = os.path.dirname(os.path.abspath(__file__))
         subprocess.run(
-            ["docker", "build", "-t", "ml-sandbox", "-f", "sandbox/Dockerfile", "sandbox/"],
+            ["docker", "build", "-t", "ml-sandbox", "-f", os.path.join(sandbox_dir, "Dockerfile"), sandbox_dir],
             check=True,
             capture_output=True
         )
@@ -93,6 +100,56 @@ class SandboxExecutor:
         start_time = time.time()
         container_name = f"sandbox-{uuid.uuid4().hex[:8]}"
 
+        cmd = self._build_docker_cmd(
+            script_path, container_name, env_vars=env_vars, out_dir=out_dir,
+            extra_files=extra_files, train_path_override=train_path_override,
+        )
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout
+            )
+            execution_time = time.time() - start_time
+            return {
+                "exit_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "execution_time": execution_time,
+                "timeout": False
+            }
+        except subprocess.TimeoutExpired as e:
+            execution_time = time.time() - start_time
+            # explicitly stop the container to avoid orphaned processes
+            subprocess.run(["docker", "stop", container_name], capture_output=True)
+            return {
+                "exit_code": -1,
+                "stdout": e.stdout.decode() if e.stdout else "",
+                "stderr": e.stderr.decode() if e.stderr else f"Execution timed out after {self.timeout} seconds.",
+                "execution_time": execution_time,
+                "timeout": True
+            }
+
+    def _build_docker_cmd(self, script_path: str, container_name: str,
+                           env_vars: Optional[Dict[str, str]] = None,
+                           out_dir: Optional[str] = None, extra_files: Optional[List[str]] = None,
+                           train_path_override: Optional[str] = None) -> List[str]:
+        """
+        Builds the full `docker run` argument list for one candidate
+        execution - every bind mount `run_candidate` passes to Docker is
+        decided here, and only here. Kept separate from run_candidate (which
+        actually invokes Docker) so tests can assert on the real mount
+        arguments a run would use - e.g. that the held-out labels file is
+        never among them - without needing a Docker daemon at all; see
+        tests/test_reward_hacking.py.
+
+        Never mounts the held-out truth.json labels file (see eval/dataset.py
+        and eval/pipeline.py) - only train.jsonl/test.jsonl from dataset_dir,
+        or train_path_override in place of train.jsonl, ever appear in a -v
+        argument built here.
+        """
         # Defense in depth against a candidate-controlled path (e.g. inside
         # a worktree) being a symlink: os.chmod and Docker's bind-mount
         # source resolution both follow symlinks, so chmod-ing or mounting
@@ -170,30 +227,4 @@ class SandboxExecutor:
             cmd += ["-e", f"{key}={value}"]
 
         cmd.append("ml-sandbox")
-
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout
-            )
-            execution_time = time.time() - start_time
-            return {
-                "exit_code": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "execution_time": execution_time,
-                "timeout": False
-            }
-        except subprocess.TimeoutExpired as e:
-            execution_time = time.time() - start_time
-            # explicitly stop the container to avoid orphaned processes
-            subprocess.run(["docker", "stop", container_name], capture_output=True)
-            return {
-                "exit_code": -1,
-                "stdout": e.stdout.decode() if e.stdout else "",
-                "stderr": e.stderr.decode() if e.stderr else f"Execution timed out after {self.timeout} seconds.",
-                "execution_time": execution_time,
-                "timeout": True
-            }
+        return cmd

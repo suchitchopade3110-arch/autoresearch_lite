@@ -258,6 +258,36 @@ def test_docker_run_command_includes_resource_hardening_flags():
         os.remove(script_path)
 
 
+def test_build_image_resolves_the_dockerfile_relative_to_the_package_not_cwd():
+    """
+    Regression test: a pip-installed `autoresearch` is invoked from
+    whatever directory the operator happens to be in, which has no reason
+    to contain a sandbox/Dockerfile of its own - _build_image must resolve
+    the Dockerfile and build context relative to this installed package's
+    own location (sandbox/executor.py's __file__), never the caller's CWD.
+    Proven by actually chdir-ing somewhere else with no Dockerfile in it
+    before constructing SandboxExecutor.
+    """
+    import sandbox.executor as executor_module
+    real_sandbox_dir = os.path.dirname(os.path.abspath(executor_module.__file__))
+
+    original_cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as empty_dir:
+        os.chdir(empty_dir)
+        try:
+            with patch("sandbox.executor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+                SandboxExecutor({'timeout_seconds': 10, 'cpu_limit': "0.5", 'memory_limit': "256m"})
+
+                build_call = next(c for c in mock_run.call_args_list if c.args[0][:2] == ["docker", "build"])
+                cmd = build_call.args[0]
+
+            assert cmd[cmd.index("-f") + 1] == os.path.join(real_sandbox_dir, "Dockerfile")
+            assert cmd[-1] == real_sandbox_dir
+        finally:
+            os.chdir(original_cwd)
+
+
 def test_gpu_access_is_absent_by_default():
     """
     Priority 1 acceptance: GPU passthrough is an isolation trade-off the
@@ -370,6 +400,7 @@ def test_run_candidate_refuses_a_symlinked_script_path():
         with patch("sandbox.executor.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             executor = SandboxExecutor({'timeout_seconds': 10, 'cpu_limit': "0.5", 'memory_limit': "256m"})
+            mock_run.reset_mock()  # constructing the executor legitimately calls `docker build`
             with pytest.raises(ValueError, match="symlink"):
                 executor.run_candidate(symlinked_script)
             mock_run.assert_not_called()
@@ -391,6 +422,7 @@ def test_run_candidate_refuses_a_symlinked_out_dir():
             with patch("sandbox.executor.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
                 executor = SandboxExecutor({'timeout_seconds': 10, 'cpu_limit': "0.5", 'memory_limit': "256m"})
+                mock_run.reset_mock()  # constructing the executor legitimately calls `docker build`
                 with pytest.raises(ValueError, match="symlink"):
                     executor.run_candidate(script_path, out_dir=symlinked_out_dir)
                 mock_run.assert_not_called()

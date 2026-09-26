@@ -212,3 +212,29 @@ def test_carry_over_elite_succeeds_for_a_valid_unmerged_parent(tmp_dir):
     # it for real. The worktree's content is still the pristine base.
     with open(os.path.join(result["worktree_path"], "candidate_script.py")) as f:
         assert f.read() == "\n"
+
+
+def test_select_parents_returns_empty_list_when_every_candidate_slot_failed(tmp_dir):
+    """
+    Regression test: a real generation-1 run against a weaker/smaller LLM
+    can have every slot exhaust its malformed-diff/duplicate retries,
+    leaving zero scored candidates. 'tournament' (the default strategy)
+    used to call max() on an empty sample in that case, crashing the
+    whole run instead of falling back to ordinary generation for the next
+    round (see run()'s `if mutation_source:` check, which already treats
+    an empty parent list the same as no parents at all).
+    """
+    repo_dir = _init_repo(tmp_dir)
+    engine, git_controller, db = _make_engine(tmp_dir, repo_dir)
+    engine.config["selection_strategy"] = "tournament"
+
+    assert engine._select_parents([]) == []
+
+
+def test_select_parents_top_k_and_default_strategies_also_handle_an_empty_population(tmp_dir):
+    repo_dir = _init_repo(tmp_dir)
+    engine, git_controller, db = _make_engine(tmp_dir, repo_dir)
+
+    for strategy in ("top-k", "some-unrecognized-strategy"):
+        engine.config["selection_strategy"] = strategy
+        assert engine._select_parents([]) == []
