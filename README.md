@@ -2,61 +2,116 @@
 
 [![Tests](https://github.com/suchitchopade3110-arch/autoresearch_lite/actions/workflows/tests.yml/badge.svg)](https://github.com/suchitchopade3110-arch/autoresearch_lite/actions/workflows/tests.yml)
 
-An autonomous ML research agent loop: propose a candidate (as a diff), apply and commit it on its own git branch, run it in a sandbox against progressively larger subsets of a dataset, and merge or roll back based on the result - with RAG-style memory of past attempts, a human-approval gate before any merge, crash recovery, and, optionally, a concurrent evolutionary search over a population of candidates per generation.
+An autonomous ML research agent loop. It proposes a candidate code change as a unified diff, applies and commits it on its own `git worktree`/branch, evaluates it in a sandboxed Docker container against progressively larger subsets of a dataset, and merges or rolls it back based on the result — gated by RAG-style memory of past attempts, a mandatory human-approval step before any merge, crash recovery, and an optional concurrent evolutionary search over a population of candidates per generation.
 
-## What's implemented
+## Architecture
 
-- **Orchestrator (`orchestrator/run.py`):** two modes.
-  - `--mode sequential` (default): one candidate at a time; loops up to `orchestrator.max_iterations`, stopping early once `target_score` is reached or `patience` iterations pass with no improvement.
-  - `--mode evolutionary`: a population of candidates per generation, evaluated concurrently and evolved via `evolution/population.py`'s `EvolutionEngine` (selection, mutation-by-prompt, Pareto/weighted scoring, adaptive population sizing, all seeded for reproducibility via `evolution.random_seed`).
-  - A `cleanup` subcommand (`python -m orchestrator.run cleanup --config ...`) reclaims state left behind by a run that crashed or was killed - orphaned candidate worktrees/branches and approval requests stuck pending past their deadline. It also runs automatically at the start of every `run` invocation, and `SIGINT`/`SIGTERM` exit cleanly instead of leaving a traceback.
-- **Config validation (`config_schema.py`):** the config file is validated against a pydantic schema at load time - a malformed or missing `eval.stages` (which would otherwise let every candidate pass evaluation with a score of 0.0) is rejected up front with a readable error, not discovered deep inside a run.
-- **Human-approval gate (`approval/`):** every candidate that passes evaluation is held pending a human decision before it merges - in either mode. The gate defaults to *required* even if the config is missing the `approval` section entirely or has a malformed value in it (see `approval/gate.py:resolve_approval_config`); only an explicit, valid `approval.enabled: false` disables it. A timeout with no decision is recorded as a real, persisted "timed_out" outcome and never merges - it is not treated as approval. In evolutionary mode, every candidate in a generation gets its approval request created up front (so a reviewer sees the whole generation together) before any of them are awaited, so a human is never a bottleneck on the sandbox pool. Decisions are stored in SQLite (`approvals.db`), so they survive a restart and are visible to both the orchestrator process and the dashboard process.
-- **Dashboard + API (`api/main.py`):** a FastAPI app serving a small, self-hosted-CSS page (`api/static/dashboard.css` - no third-party CDN script, auto-refreshing, no separate frontend build) to review and approve/reject pending candidates, plus JSON endpoints (`/api/pending`, `/api/approvals`, `/api/history`, `/api/report`). It reads directly from the same ChromaDB store, approval database, and `evolution_report.jsonl` the orchestrator writes to - there's no separate/forked data store to drift out of sync. Protected by HTTP Basic Auth (fail-safe: required unless explicitly disabled) and an `httponly` double-submit-cookie CSRF token on the approve/reject forms - see [Dashboard security](#dashboard-security) below.
-- **Report generator (`reporting/report_generator.py`):** `compute_kpis()` is the single function both the dashboard and the end-of-run report (`reports/latest_report.md`, written automatically when a run finishes) call - so the two surfaces can't independently recompute the same numbers differently. Tracks merge rate, duplicate-avoidance rate, compute cost per improvement, and approval outcomes.
-- **Git State Controller (`vcs/git_controller.py`):** every candidate gets its own `git worktree`, so branching, committing, merging, and rolling back a candidate never touches the caller's main checkout (or any uncommitted work in it) - and concurrent candidates in the evolutionary path never share a checkout with each other. A merge rebases the candidate onto the target branch inside its own worktree first, then advances the target ref with a compare-and-swap `git update-ref` - never a `git checkout`/`git merge` in the caller's working tree, so it can neither switch whatever branch the caller has checked out (when `base_ref` names a different one) nor crash on a dirty working tree. A conflict (in the rebase, or in the compare-and-swap if the ref moved concurrently) raises `MergeConflict` (recorded as a distinct `conflict` outcome) rather than ever leaving the shared checkout mid-merge. `target.repo_path`/`target.base_ref` let the repo under evolution be a separate checkout from this harness's own repository, and the controller survives a detached HEAD instead of crashing.
-- **Diff-scope guard (`vcs/diff_guard.py`):** every candidate-generated diff is checked BEFORE it ever reaches `git apply` - a diff that touches any path outside `target.files`, creates a symlink, or changes a permission bit/renames/copies a file is refused outright, with a real reason recorded. `git apply` itself has no concept of "only these files are authorized"; without this, a diff could rewrite the harness's own evaluation code, or turn a sandbox output directory into a symlink escaping to an arbitrary host path. This guard is enforced identically in both modes: evolutionary mode's candidate generation (`evolution/population.py`) and evaluation (`evolution/scheduler.py`) both call `generation/patch_generator.py`'s lower-level `validate_and_apply_patch(..., allowed_files=target.files)` directly, rather than going through the higher-level `PatchGenerator.generate_and_apply()` multi-file wrapper the sequential path uses - that bypass only affects multi-file support (see the known limitation below), not the scope guard itself, which every call site still passes `allowed_files` into. See `tests/test_evolution_scheduler.py::test_out_of_scope_diff_is_rejected_before_ever_reaching_the_sandbox` and `tests/test_evolution_population.py::test_generate_candidate_rejects_a_diff_out_of_target_files_scope`.
-- **Crash recovery (`vcs/git_controller.py:cleanup_orphans`, `approval/store.py:timeout_stale_requests`):** a previous run that was killed mid-flight leaves candidate worktrees/branches and possibly a pending approval behind; both are reclaimed automatically at startup (or via the `cleanup` subcommand) rather than accumulating indefinitely.
-- **Structured logging (`observability/logging_config.py`):** JSON logs to stdout, with `run_id` (and `candidate_id`, where applicable) bound to every record, so a run's log lines can be correlated and filtered without parsing free-text.
-- **Execution Sandbox (`sandbox/executor.py`):** runs each candidate in Docker as a non-root user, with `--network none`, a read-only root filesystem, dropped capabilities, `--pids-limit` (fork-bomb protection), a per-process open-file-descriptor `--ulimit`, a size-capped `/tmp` tmpfs, and the existing CPU/memory limits and wall-clock timeout.
-- **Real evaluation pipeline (`eval/dataset.py`, `eval/pipeline.py`):** by default, a deterministic synthetic dataset (a noisy linear boundary), split into `train.jsonl`/`test.jsonl`/`holdout.jsonl` (all mounted read-only into the sandbox, at their respective times) and `truth.json`/`holdout_truth.json` (the held-out labels - stay on the host, never mounted) - see [Bring your own project](#bring-your-own-project) to point this at real data and a real metric instead. The generator's own seed is a fresh, secret, host-only value by default (`eval/dataset.py:generate_split`) - not the codebase's own public default - so a candidate can't sidestep `truth.json` entirely by replaying the (also public) generator code itself; brute-forcing the seed from a mounted `train.jsonl` row is infeasible inside the sandbox's own CPU/time limits. A candidate reads `TRAIN_PATH`/`TEST_PATH`/`SUBSET_PERCENTAGE`, but that env var is only informational - each stage's `TRAIN_PATH` is a HOST-SELECTED subset file (`eval/dataset.py:write_subset`), so a candidate that ignores it (or claims a smaller subset than it actually used) physically cannot see more rows than its stage allots, not just dishonestly claim to have used fewer. `TEST_PATH` stays the whole test set at every stage, so scores remain comparable across stages. A candidate writes real predictions to `/app/out/predictions.jsonl`, which `EvalPipeline.score_predictions()` scores against `truth.json` via a pluggable scorer (`eval.scorer` in config, defaulting to binary accuracy) - the file itself is always opened with a symlink AND named-pipe (FIFO) check and a size cap first, regardless of scorer, so a candidate can't turn that host-side read into a denial of service (a FIFO has no fixed size, defeating the size cap the same way a symlink to `/dev/zero` would). A printed `SCORE:` line is parsed only as a diagnostic to flag a mismatch between what the candidate claims and its real score - it is never trusted for gating, so a candidate cannot buy a merge by printing a perfect score claim (see `tests/test_reward_hacking.py`). A merge also requires beating the best-known score for that stage by `eval.min_improvement` (`eval/baseline.py`), not just clearing the stage's absolute threshold - including in evolutionary mode, where the baseline is re-checked and a rebased candidate re-evaluated immediately before it actually finalizes, not just once during its own generation's initial scoring pass (`evolution/scheduler.py`).
-- **Sealed holdout evaluation (`eval/pipeline.py:run_holdout_evaluation`):** every progressive-scaling stage and the baseline gate score a candidate against the same "selection" set (`test.jsonl`) every time - across many candidates and generations, gating merge decisions on that one fixed sample risks the "best-known score" ratcheting upward on the sample's own sampling noise as much as on genuine improvement. `dataset.holdout_frac` carves a second, sealed set (`holdout.jsonl`/`holdout_truth.json`) out of the held-out portion, never touched by any stage or the baseline gate. A candidate that clears every stage and the baseline check is scored exactly once more, trained on the full (unsubsetted) training data, against this sealed set - the result (`metrics.holdout_score`) is attached to the candidate's record and shown on the dashboard alongside the selection score, but is never itself fed back into `BaselineStore` or any auto-approve criterion. A large gap between the two scores is a signal that the selection score has been overfit to. Optional for `dataset.mode: custom` (skipped gracefully, with a note, if `holdout.jsonl`/`holdout_truth.json` aren't present in the operator's dataset directory).
-- **Experiment Memory (RAG) (`memory/db.py`):** a local ChromaDB instance storing hypotheses, diffs, outcomes, metrics, and rationale per experiment (cosine distance, so `evolution/duplicate_checker.py`'s similarity threshold is meaningful). An exact-diff repeat is caught via a cheap metadata lookup (`has_exact_diff`) before paying for an embedding + nearest-neighbor search.
-- **Failure Analysis (`memory/failure_analysis.py`):** categorizes failures (syntax, runtime, timeout, resource-limit, metric-regression).
-- **Prompt Builder (`generation/prompt_builder.py`):** retrieves past successes/failures from memory into the next prompt.
-- **Patch Generation (`generation/patch_generator.py`):** validates and applies unified diffs against `LLMClient.generate_diff(prompt, target_file, current_content)` - every call includes the target file's real current content, so a real model writes a diff against what's actually there rather than a stale assumption. Three implementations: `MockLLMClient` (default, no network/key needed - always implements the same honest baseline solution), `AnthropicClient` (`generation.client: anthropic` in config; reads `ANTHROPIC_API_KEY` from the environment, never from config), and `LocalLLMClient` (`generation.client: local`; talks to an OpenAI-compatible local server - Ollama, vLLM, llama.cpp, ... - via `generation.base_url`, no key needed). Both real clients retry up to 3 times on a `git apply --check` failure, feeding the actual stderr back into the next prompt, and record `input_tokens`/`output_tokens`/`estimated_cost_usd` into every candidate's metrics and the end-of-run report (`estimated_cost_usd` is always `0.0` for `LocalLLMClient` - local inference has no per-token billing).
-- **Static Analysis Pre-check (`generation/static_check.py`):** rejects malformed/invalid syntax before sandbox execution.
-- **Multi-objective scoring (`evolution/scoring.py`):** a candidate's real evaluation score drives selection, and a failed candidate can never outrank a successful one under either scoring strategy regardless of how fast it failed.
+```
+                    ┌─────────────────────┐
+                    │   Orchestrator      │  orchestrator/run.py
+                    │ (sequential | evo)  │
+                    └──────────┬──────────┘
+                               │
+        ┌──────────────────────┼──────────────────────┐
+        ▼                      ▼                       ▼
+┌───────────────┐    ┌───────────────────┐    ┌──────────────────┐
+│ Prompt Builder │──▶│ Patch Generator    │──▶│ Diff-Scope Guard  │
+│ (RAG memory)   │    │ (LLM client)       │    │ (vcs/diff_guard)  │
+└───────────────┘    └───────────────────┘    └────────┬─────────┘
+                                                         ▼
+                                              ┌──────────────────┐
+                                              │ Git Controller    │  per-candidate worktree
+                                              │ (vcs/git_controller)│
+                                              └────────┬─────────┘
+                                                         ▼
+                                              ┌──────────────────┐
+                                              │ Execution Sandbox │  Docker, --network none,
+                                              │ (sandbox/executor) │  non-root, ro rootfs
+                                              └────────┬─────────┘
+                                                         ▼
+                                              ┌──────────────────┐
+                                              │ Eval Pipeline      │  staged scoring +
+                                              │ (eval/pipeline)    │  sealed holdout
+                                              └────────┬─────────┘
+                                                         ▼
+                                              ┌──────────────────┐
+                                              │ Approval Gate      │  SQLite, human decision
+                                              │ (approval/)        │  required by default
+                                              └────────┬─────────┘
+                                                         ▼
+                                    merge (compare-and-swap ref update) or rollback
+```
 
-## What's NOT implemented yet
+`memory/db.py` (ChromaDB) and `api/main.py` (dashboard/API) both read/write the same on-disk stores (`chroma_db/`, `approvals.db`, `evolution_report.jsonl`), so there is no separate data path to drift out of sync between the orchestrator process and the dashboard process.
 
-- **`MockLLMClient` always returns the same diff regardless of prompt/history.** This is deliberate - it's the zero-setup default with no network or API key needed, not a bug. Set `generation.client: anthropic` or `generation.client: local` for a real, context-aware model. **No live end-to-end run with a real LLM client has been executed as part of this codebase's remediation work** (no API key was provided or guessed, per that work's own ground rules) - there is currently no empirical evidence that the loop improves a real task with a real model, only that its safety/integrity mechanisms hold. Before relying on this for a real research workload, run it end-to-end with `generation.client: anthropic` against a task that has real room to improve (the built-in synthetic task is close to its achievable ceiling on the first try - see the `min_improvement` note in `configs/example.yaml`), across multiple seeds, and compare against a random-search baseline at the same compute budget.
-- **Carbon-footprint methodology.** `energy_proxy` is `execution_time * energy_proxy_watts_constant` (an arbitrary multiplier, default 10.0), not a real methodology like CodeCarbon or a grid-intensity constant - it's a placeholder signal for relative comparison between candidates, not an absolute measurement.
-- **Evolutionary mode's population all edits one file.** Every candidate in a generation patches `candidate_script.py` from the same base; once the first candidate in a generation finalizes, every other candidate touching the same lines either conflicts on rebase (recorded as `conflict`) or collapses to a no-op (recorded as `no_op_after_rebase`) - see `evolution/scheduler.py`'s phase 2. This is a real, structural limitation of evolving a single-file candidate concurrently, not a bug: a population size larger than roughly "one real winner per generation" spends most of its sandbox budget on candidates that can't co-exist with whichever one merges first. `target.files` supporting more than one file (sequential mode already does) would let different candidates plausibly touch disjoint files, but evolutionary mode doesn't support multi-file candidates yet (see the known limitation on `evolution/population.py`/`evolution/scheduler.py` elsewhere in this file).
-- **A human's approval doesn't necessarily cover the exact code that ships.** In evolutionary mode, a candidate is approved after being evaluated against the base it was created from - but if another candidate in the same generation merges first, the approved diff is rebased onto that new base before finalizing. The rebased result is re-evaluated for real before it merges (see `evolution/scheduler.py` phase 2), so it's never published unverified, but a human never explicitly re-reviewed that specific (diff, new-base) combination. This is recorded transparently (`metrics.rebased_after_approval`, `approved_base_commit`, `merged_base_commit` - shown as a "rebased after approval" badge in the dashboard's experiment history) rather than silently treated as equivalent to what was shown for approval; a full second human-approval round per rebase was deliberately not added, since it would defeat the two-phase scheduler's entire point of not blocking the sandbox pool on a human.
+## Core components
 
-## Security Disclaimer
+| Component | File | Responsibility |
+|---|---|---|
+| Orchestrator | `orchestrator/run.py` | Drives the loop; `--mode sequential` (default, one candidate at a time, up to `max_iterations`, early-stops on `target_score`/`patience`) or `--mode evolutionary` (population per generation via `evolution/population.py`'s `EvolutionEngine`). `cleanup` subcommand reclaims orphaned state; runs automatically at every `run` start; `SIGINT`/`SIGTERM` exit cleanly. |
+| Config validation | `config_schema.py` | Pydantic schema validated at load time — a malformed/missing `eval.stages` is rejected up front instead of silently scoring every candidate 0.0. |
+| Prompt Builder | `generation/prompt_builder.py` | Retrieves past successes/failures from memory into the next generation prompt. |
+| Patch Generator | `generation/patch_generator.py` | Validates and applies unified diffs via `LLMClient.generate_diff(prompt, target_file, current_content)`. Three implementations: `MockLLMClient` (default, deterministic, no network/key), `AnthropicClient` (`generation.client: anthropic`, reads `ANTHROPIC_API_KEY` from env only), `LocalLLMClient` (`generation.client: local`, OpenAI-compatible endpoint via `generation.base_url`). Both real clients retry up to `generation.max_apply_retries` (default 3) on `git apply --check` failure, feeding stderr back into the next prompt, and record token counts/estimated cost. |
+| Static Analysis | `generation/static_check.py` | Rejects malformed/invalid syntax before it ever reaches the sandbox. |
+| Diff-Scope Guard | `vcs/diff_guard.py` | Checked before `git apply`: rejects any diff touching a path outside `target.files`, creating a symlink, or changing permission bits/renames/copies. Enforced identically in both modes via `generation/patch_generator.py:validate_and_apply_patch(..., allowed_files=target.files)`. |
+| Git State Controller | `vcs/git_controller.py` | One `git worktree` per candidate — branching/committing/merging/rollback never touches the caller's main checkout. Merge = rebase candidate onto target inside its own worktree, then advance the target ref via compare-and-swap `git update-ref` (never `git checkout`/`git merge` on the shared tree). Conflicts raise `MergeConflict` (recorded as `conflict`), never leave the shared checkout mid-merge. Detects/warns if a separate linked worktree elsewhere is also checked out on the target branch. |
+| Execution Sandbox | `sandbox/executor.py` | Docker container, non-root user, `--network none`, read-only root filesystem, dropped capabilities, `--pids-limit`, per-process fd `--ulimit`, size-capped `/tmp` tmpfs, `--cpus`/`--memory` limits, wall-clock timeout. |
+| Eval Pipeline | `eval/dataset.py`, `eval/pipeline.py` | Deterministic synthetic dataset by default (noisy linear boundary), split into `train`/`test`/`holdout` (mounted read-only at their respective stages) plus `truth.json`/`holdout_truth.json` (host-only, never mounted). Host-selected subset files enforce the progressive-scaling stage boundary regardless of what a candidate claims. Predictions are scored against `truth.json` via a pluggable `eval.scorer`; the printed `SCORE:` line is a diagnostic only, never trusted for gating. A merge also requires beating `eval.min_improvement` over the best-known score for that stage (`eval/baseline.py`). |
+| Sealed Holdout | `eval/pipeline.py:run_holdout_evaluation` | A second held-out split never touched by any stage or the baseline gate; a candidate that clears every stage is scored once more against it (`metrics.holdout_score`), shown alongside the selection score but never fed back into any auto-approve criterion — flags overfitting to the selection sample. |
+| Experiment Memory (RAG) | `memory/db.py` | Local ChromaDB store of hypotheses, diffs, outcomes, metrics, rationale (cosine distance). Exact-diff repeats are caught cheaply via metadata lookup (`has_exact_diff`) before paying for an embedding + nearest-neighbor search. |
+| Failure Analysis | `memory/failure_analysis.py` | Categorizes failures: syntax, runtime, timeout, resource-limit, metric-regression. |
+| Multi-objective Scoring | `evolution/scoring.py` | Real evaluation score drives selection; a failed candidate can never outrank a successful one under either scoring strategy. |
+| Approval Gate | `approval/` | Every candidate that passes evaluation is held pending human decision, in both modes. Defaults to *required* even on a missing/malformed `approval` config (`approval/gate.py:resolve_approval_config`) — only an explicit, valid `approval.enabled: false` disables it. A timeout with no decision persists as `timed_out` and never merges. In evolutionary mode, every candidate in a generation gets its approval request created up front so a human is never a bottleneck on the sandbox pool. Decisions persist in SQLite (`approvals.db`). |
+| Dashboard + API | `api/main.py` | FastAPI app + self-hosted-CSS page (no third-party CDN, auto-refreshing) for reviewing/approving/rejecting candidates, plus `/api/pending`, `/api/approvals`, `/api/history`, `/api/report`. Reads directly from the same ChromaDB store, approval DB, and `evolution_report.jsonl` the orchestrator writes. Protected by HTTP Basic Auth (fail-safe: required unless explicitly disabled) and an httponly double-submit-cookie CSRF token. |
+| Report Generator | `reporting/report_generator.py` | `compute_kpis()` is the single function both the dashboard and the end-of-run report (`reports/latest_report.md`) call, so the two surfaces can't diverge. Tracks merge rate, duplicate-avoidance rate, compute cost per improvement, approval outcomes. |
+| Crash Recovery | `vcs/git_controller.py:cleanup_orphans`, `approval/store.py:timeout_stale_requests`, `sandbox/executor.py:cleanup_orphan_containers` | Reclaims orphaned worktrees/branches, stale pending approvals, and still-running sandbox containers automatically at startup or via `cleanup`. Containers are host-global, not repo-scoped — not fully safe with two concurrent orchestrator processes on the same host. |
+| Structured Logging | `observability/logging_config.py` | JSON logs to stdout with `run_id` (and `candidate_id` where applicable) bound to every record. |
 
-The sandbox runs candidates as a non-root user, with `--network none`, a read-only root filesystem, dropped capabilities, a `--pids-limit`, a per-process file-descriptor `--ulimit`, a size-capped `/tmp` tmpfs, and standard Docker `--cpus`/`--memory` limits plus a wall-clock timeout via `subprocess`. This meaningfully raises the bar against a candidate trying to exfiltrate data, persist state, exhaust the host's process table, or exceed its resource limits. **It still does NOT provide hardened security against zero-days, container escapes, or a deliberately adversarial kernel exploit.** Do not execute untrusted malware in this sandbox.
+## Loop mechanics (sequential mode)
 
-## Dashboard security
+```
+for iteration in 1..max_iterations:
+    prompt          = PromptBuilder.build(goal, memory.retrieve(goal))
+    diff            = LLMClient.generate_diff(prompt, target_file, current_content)
+    static_check(diff)                              # reject malformed syntax
+    diff_guard.validate(diff, allowed_files)         # reject out-of-scope diff
+    worktree        = GitController.create_worktree(candidate_branch)
+    apply_and_commit(worktree, diff)
+    for stage in eval.stages:                        # progressive scaling
+        run in sandbox(subset=stage.subset_percentage)
+        score = score_predictions(...)
+        if score < stage.threshold: reject; break
+    if all stages passed and score beats baseline.min_improvement:
+        holdout_score = run_holdout_evaluation(worktree)   # informational only
+        approval = ApprovalGate.request(candidate)
+        wait up to approval.timeout_seconds
+        if approved: GitController.merge(worktree)         # rebase + CAS ref update
+        else: rollback
+    memory.record(diff, outcome, metrics)
+    if score >= target_score or patience exceeded: break
+```
 
-The dashboard is fail-safe like the approval gate: **authentication is required unless explicitly disabled.**
+Evolutionary mode (`--mode evolutionary`) runs this per candidate concurrently across a population (`evolution.population_size`) per generation, evaluated via `evolution/scheduler.py`, selected/mutated via `evolution/population.py`'s `EvolutionEngine` (tournament/other selection, mutation-by-prompt, Pareto or weighted scoring, adaptive population sizing — all seeded via `evolution.random_seed`).
 
-- Set `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` in the environment to enable HTTP Basic Auth on every route (the page and every `/api/*` endpoint).
-- If neither is set and auth hasn't been explicitly disabled, every request is rejected (401) - there's no way to authenticate, so nobody gets in. This is deliberate: an unauthenticated dashboard that can approve merges into your codebase should never be reachable by default.
-- For local/single-user use where this is unnecessary, set `DASHBOARD_AUTH_DISABLED=true` explicitly.
-- The approve/reject forms carry a CSRF token (double-submit cookie pattern) - a POST without a matching token is rejected (403), regardless of auth, so a cross-site auto-submitting form can't trigger an approval using a browser's cached credentials.
+## Security model
 
-## How to run locally
+- **Sandbox isolation:** Docker, `--network none`, non-root user, read-only root filesystem, dropped capabilities, `--pids-limit` (fork-bomb protection), per-process `--ulimit` (fd exhaustion), size-capped `/tmp` tmpfs, `--cpus`/`--memory` limits, `subprocess`-enforced wall-clock timeout. **Not** hardened against zero-days, container escapes, or a deliberately adversarial kernel exploit — do not run untrusted malware in it.
+- **Diff scope enforcement:** every diff is validated against `target.files` *before* `git apply` — `git apply` itself has no such concept. Prevents a candidate from rewriting the harness's own evaluation code or symlinking a sandbox output path to an arbitrary host path.
+- **No shared-checkout corruption:** merges never run in the caller's working tree; a rebase conflict or a concurrent ref move raises a typed error instead of leaving a shared checkout mid-merge.
+- **No answer-key leakage:** `truth.json`/`holdout_truth.json` stay host-side, never mounted into the sandbox. The dataset generator's seed is a fresh, secret, host-only value by default — a fixed/public seed would let a candidate regenerate held-out labels from the (public) generator code.
+- **No reward hacking via output forgery:** `predictions.jsonl` is opened with a symlink AND named-pipe (FIFO) check plus a size cap before scoring, regardless of scorer — a FIFO has no fixed size and would defeat a size cap the same way a symlink to `/dev/zero` would. A candidate's self-reported `SCORE:` line is compared against the real score only as a diagnostic, never trusted for gating (see `tests/test_reward_hacking.py`).
+- **Fail-safe approval gate:** required by default even on a missing/malformed config; only an explicit `approval.enabled: false` disables it.
+- **Fail-safe dashboard auth:** HTTP Basic Auth required unless `DASHBOARD_AUTH_DISABLED=true` is set explicitly. Approve/reject POSTs carry a double-submit-cookie CSRF token and validate `Origin` (fallback `Referer`) against `Host` — a check no other port can forge, closing the gap that `SameSite=Strict` alone leaves (SameSite's "site" check is host-based and ignores port).
+
+## Setup
 
 ### Prerequisites
 
-- Docker must be installed and running.
+- Docker installed and running
 - Python 3.9+
 - `pip install -r requirements.txt`
 
-### 1. Start the dashboard (in its own terminal)
+### 1. Start the dashboard
 
 ```bash
 # Local/single-user use:
@@ -66,48 +121,44 @@ DASHBOARD_AUTH_DISABLED=true uvicorn api.main:app --reload
 DASHBOARD_USERNAME=admin DASHBOARD_PASSWORD=change-me uvicorn api.main:app --reload
 ```
 
-Open `http://localhost:8000` to see pending approvals and run history. Leave this running - the orchestrator will block waiting for decisions made here.
+Open `http://localhost:8000` for pending approvals and run history. Leave it running — the orchestrator blocks on decisions made here.
 
-### 2. Run the orchestrator (sequential mode)
-
-```bash
-python -m orchestrator.run --config configs/example.yaml --goal "Improve model performance"
-# optional: --max-iterations 10 --target-score 0.9 --patience 3
-```
-
-Each candidate that passes evaluation shows up on the dashboard; approve or reject it there. No decision within `approval.timeout_seconds` (default 30 minutes) holds it - it will not merge.
-
-### Evolutionary mode
+### 2. Run the orchestrator
 
 ```bash
+# Sequential
+python -m orchestrator.run --config configs/example.yaml --goal "Improve model performance" \
+  --max-iterations 10 --target-score 0.9 --patience 3
+
+# Evolutionary
 python -m orchestrator.run --config configs/example.yaml --goal "Improve model performance" --mode evolutionary
 ```
 
-Every candidate that passes evaluation in every generation gets its own pending approval, resolved independently and concurrently. Writes `evolution_report.jsonl` (one line per generation), stores every candidate's outcome in ChromaDB (`chroma_db/`), and writes `reports/latest_report.md` when the run finishes.
+No approval decision within `approval.timeout_seconds` (default 1800s) holds the candidate — it will not merge.
 
-### Recovering from a crash
+### 3. Recovering from a crash
 
 ```bash
 python -m orchestrator.run cleanup --config configs/example.yaml
 ```
 
-Removes any candidate worktrees/branches left behind by a run that was killed or crashed, and times out any approval request that's been pending past its deadline with nobody left to resolve it. Runs automatically at the start of every `run` invocation too, so this is mainly useful to run standalone after a crash without immediately starting a new run.
+Also runs automatically at the start of every `run` invocation; useful standalone after a crash without immediately starting a new run.
 
-### Running without a human present (e.g. CI, demos)
+### Running without a human present (CI, demos)
 
-Set `approval.enabled: false` explicitly in your config. This is an intentional, visible override, not a silent default - the shipped `configs/example.yaml` defaults to `enabled: true` and requires a human decision.
+Set `approval.enabled: false` explicitly. `configs/example.yaml` ships with `enabled: true`.
 
 ### Separating the harness from the code under evolution
 
-By default, `target.repo_path` is `.` - candidates are generated directly into this harness's own repository. To evolve a separate codebase instead (recommended for anything beyond local experimentation), point `target.repo_path` at that repository's checkout; the orchestrator warns at startup if it resolves back to the harness's own directory.
+`target.repo_path` defaults to `.` (the harness's own repo). Point it at a separate checkout for anything beyond local experimentation — the orchestrator warns at startup if it resolves back to the harness's own directory.
 
 ### Bring your own project
 
-Out of the box this harness only knows how to evolve solutions to its one built-in demo task (a synthetic linear-boundary classifier). Pointing it at a real project means three config changes, no harness source edits required:
+Three config changes, no harness source edits:
 
-1. **`target.repo_path`** - the repo candidates are generated into. Point it at your own checkout (see [Separating the harness from the code under evolution](#separating-the-harness-from-the-code-under-evolution) above) and set `target.files` to whichever file(s) a candidate is allowed to touch.
-2. **`dataset.mode: custom`** - skips the built-in synthetic generator and validates that `train.jsonl`/`test.jsonl`/`truth.json` already exist at `dataset.path`, in whatever row shape your own task and scorer expect (only the three filenames are checked, not row schema - see `eval/dataset.py:validate_custom_dataset`). `truth.json` still must never be readable by a candidate - keep it out of any path `sandbox/executor.py` would mount (it mounts individual files by name, never a whole directory, so this holds automatically as long as `truth.json` lives in `dataset.path` alongside the other two).
-3. **`eval.scorer: "your_module:your_function"`** - a dotted import path to a function `(preds: Dict[str, Any], truth: Dict[str, Any]) -> Tuple[float, str]`, replacing the default binary-accuracy scorer (`eval.pipeline:binary_accuracy_scorer`). `preds` is `{id: <whatever your candidate wrote as "pred">}`, already past the symlink/size-cap safety checks (those run unconditionally, before any scorer sees the file) - your function only decides what "score" means for your task. Return `(0.0, "reason")` for anything that should count as a clean failure rather than raising.
+1. `target.repo_path` + `target.files` — the checkout and file(s) a candidate may touch.
+2. `dataset.mode: custom` — skips the synthetic generator, validates `train.jsonl`/`test.jsonl`/`truth.json` exist at `dataset.path` (filenames only checked, not row schema — see `eval/dataset.py:validate_custom_dataset`). Keep `truth.json` out of any path the sandbox would mount.
+3. `eval.scorer: "your_module:your_function"` — dotted path to `(preds: Dict[str, Any], truth: Dict[str, Any]) -> Tuple[float, str]`, replacing `eval.pipeline:binary_accuracy_scorer`. Return `(0.0, "reason")` for a clean failure rather than raising.
 
 ```yaml
 target:
@@ -115,61 +166,69 @@ target:
   files: ["your_module/candidate_script.py"]
 
 dataset:
-  path: "your_dataset_dir"   # must already contain train.jsonl/test.jsonl/truth.json
+  path: "your_dataset_dir"
   mode: custom
 
 eval:
   scorer: "your_module.scoring:score"
   stages:
     - subset_percentage: 100
-      threshold: 0.0   # whatever your metric's floor is
+      threshold: 0.0
 ```
-
-The `--goal` string is already fully generic (it's just free text fed into the prompt alongside retrieved memory) - no change needed there for a new task.
 
 ### Swapping in a real LLM
 
-Set `generation.client: anthropic` in your config and export `ANTHROPIC_API_KEY` - see `generation/patch_generator.py:AnthropicClient`.
+```bash
+export ANTHROPIC_API_KEY=...
+```
+```yaml
+generation:
+  client: anthropic
+  # model: claude-sonnet-5   # default
+```
 
-To run against a local model instead - no API key, no per-token cost, but expect a higher malformed-diff retry rate than a frontier model - set `generation.client: local` and point `generation.base_url` at an OpenAI-compatible `/chat/completions` endpoint (Ollama, vLLM, llama.cpp server, ...); see `generation/patch_generator.py:LocalLLMClient`. A code-tuned model (e.g. Qwen2.5-Coder, DeepSeek-Coder) will apply far more reliably than a general chat model. Both real clients retry a `git apply --check` failure up to `generation.max_apply_retries` times (default 3) before giving up on that candidate slot, feeding the real error back into the next prompt each time - raise it for a smaller/weaker local model that needs more shots to land a clean diff.
+For a local model (no API key, no per-token cost, higher malformed-diff retry rate than a frontier model):
 
-To use a different provider, implement the `LLMClient` interface:
+```yaml
+generation:
+  client: local
+  base_url: "http://localhost:11434/v1"   # any OpenAI-compatible /chat/completions endpoint
+  max_apply_retries: 5                    # raise for a weaker local model
+```
+
+A code-tuned model (Qwen2.5-Coder, DeepSeek-Coder, ...) applies far more reliably than a general chat model.
+
+To integrate another provider, implement `LLMClient`:
 
 ```python
 class MyRealLLMClient(LLMClient):
     def generate_diff(self, prompt: str, target_file: str, current_content: str) -> str:
-        # Call your API here and return the string unified diff
         return api.call(prompt, current_content)
 ```
 
-### Config Schema (`configs/example.yaml`)
+## Config reference (`configs/example.yaml`)
 
 ```yaml
-# Repo under evolution - defaults to "." (this harness's own repo).
 target:
   repo_path: "."
-  # base_ref: main            # pin a base commit/branch explicitly
+  # base_ref: main
 
 sandbox:
   timeout_seconds: 5
   cpu_limit: "0.5"
   memory_limit: "256m"
-  pids_limit: 128             # fork-bomb protection
-  ulimit_nofile: 1024         # per-process open file descriptors
-  tmpfs_size_mb: 64           # /tmp is RAM-backed - cap its size
+  pids_limit: 128
+  ulimit_nofile: 1024
+  tmpfs_size_mb: 64
 
 dataset:
-  path: "dummy_data"  # directory - train.jsonl/test.jsonl/truth.json generated once if missing
+  path: "dummy_data"
   size: 1000
-  # seed intentionally omitted - eval/dataset.py generates a fresh, secret,
-  # host-only seed when unset. Set this only for a reproducible test
-  # fixture; a fixed/public seed lets a candidate regenerate the held-out
-  # labels from this repo's own (public) generator code without ever
-  # touching truth.json. See eval/dataset.py:generate_split's docstring.
+  # seed intentionally omitted — see eval/dataset.py:generate_split docstring
   test_frac: 0.25
 
 eval:
-  stages:                          # progressive scaling - must be non-empty
+  stages:                          # non-empty, progressive scaling
     - subset_percentage: 1
       threshold: 0.5
     - subset_percentage: 5
@@ -178,8 +237,8 @@ eval:
       threshold: 0.7
     - subset_percentage: 100
       threshold: 0.8
-  min_improvement: 0.001           # a merge must also beat the best-known score for its final stage by this much
-  state_path: "state.json"         # persisted best-known score per stage
+  min_improvement: 0.001
+  state_path: "state.json"
 
 orchestrator:                      # sequential mode only
   max_iterations: 1
@@ -199,8 +258,7 @@ generation:
   max_retrieved_failures: 2
   max_retrieved_successes: 2
   prompt_char_budget: 4000
-  client: mock                      # or "anthropic" - needs ANTHROPIC_API_KEY in the environment
-  # model: claude-sonnet-5          # anthropic only, defaults to claude-sonnet-5
+  client: mock                     # or "anthropic" / "local"
 
 approval:                          # both modes
   enabled: true                    # missing/malformed config also defaults to true
@@ -209,14 +267,21 @@ approval:                          # both modes
   db_path: "approvals.db"
 ```
 
-## Running Tests
+## Known limitations
+
+- **`MockLLMClient` always returns the same diff regardless of prompt/history** — the zero-setup default, not a bug. No live end-to-end run with a real LLM client has been executed as part of this codebase's remediation work; there is no empirical evidence yet that the loop improves a real task with a real model, only that its safety/integrity mechanisms hold. Validate with `generation.client: anthropic` against a task with real headroom (the built-in synthetic task is near its achievable ceiling on the first try), across multiple seeds, against a random-search baseline at equal compute budget.
+- **Carbon-footprint proxy is not a real methodology.** `energy_proxy = execution_time * energy_proxy_watts_constant` (default 10.0) is a placeholder for relative comparison, not CodeCarbon or a grid-intensity constant.
+- **Evolutionary mode's population all edits one file.** Every candidate in a generation patches `candidate_script.py` from the same base; once the first candidate finalizes, others touching the same lines either conflict on rebase (`conflict`) or collapse to `no_op_after_rebase`. Multi-file candidates aren't supported in evolutionary mode yet (sequential mode already supports `target.files` with multiple entries).
+- **A human's approval doesn't necessarily cover the exact code that ships (evolutionary mode).** If another candidate in the same generation merges first, an approved diff is rebased onto the new base before finalizing and re-evaluated for real (never published unverified) — but a human never explicitly re-reviewed that specific (diff, new-base) pair. Recorded transparently via `metrics.rebased_after_approval`, `approved_base_commit`, `merged_base_commit` (shown as a dashboard badge) rather than silently treated as equivalent.
+
+## Testing
 
 ```bash
 pytest
 ```
 
-Most test files are pure Python and need no Docker. `test_sandbox.py` and `test_integration*.py` build and run the Docker sandbox image and require Docker to be running (the one exception is `test_sandbox.py`'s `test_docker_run_command_includes_resource_hardening_flags`, which mocks `subprocess.run` and needs no daemon). CI (`.github/workflows/tests.yml`) runs the full suite, including these, on every push and pull request against `main`.
+Most test files are pure Python, no Docker required. `test_sandbox.py` and `test_integration*.py` build/run the Docker sandbox image (exception: `test_sandbox.py::test_docker_run_command_includes_resource_hardening_flags`, which mocks `subprocess.run`). CI (`.github/workflows/tests.yml`) runs the full suite on every push/PR against `main`.
 
 ## License
 
-MIT - see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
