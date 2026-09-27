@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 from unittest.mock import MagicMock, patch
 
@@ -468,6 +469,78 @@ def test_run_candidate_rejects_execution_when_out_dir_exceeds_the_size_cap():
             assert "MB cap" in result['stderr']
         finally:
             os.remove(script_path)
+
+
+def test_run_candidate_timeout_bounds_docker_stop_with_a_time_flag_and_falls_back_to_kill():
+    """
+    Second council-audit-round finding: subprocess.run's own timeout only
+    kills the LOCAL `docker run` client process - the docker daemon
+    manages the container independently and can keep it running after the
+    client disconnects, and a bare (unbounded) `docker stop` could itself
+    hang if the daemon is unresponsive. Verifies the stop call is bounded
+    with --time, and that a `docker kill` fallback fires when stop itself
+    reports failure. Doesn't need a real docker daemon.
+    """
+    with tempfile.NamedTemporaryFile(suffix='.py', delete=False) as f:
+        script_path = f.name
+    try:
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["docker", "run"]:
+                raise subprocess.TimeoutExpired(cmd, 5)
+            if cmd[:2] == ["docker", "stop"]:
+                return MagicMock(returncode=1)  # stop failed to confirm
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("sandbox.executor.subprocess.run", side_effect=fake_run):
+            executor = SandboxExecutor({'timeout_seconds': 1, 'cpu_limit': "0.5", 'memory_limit': "256m"})
+            result = executor.run_candidate(script_path)
+
+        assert result['timeout'] is True
+        stop_calls = [c for c in calls if c[:2] == ["docker", "stop"]]
+        kill_calls = [c for c in calls if c[:2] == ["docker", "kill"]]
+        assert stop_calls and "--time" in stop_calls[0]
+        assert kill_calls  # fallback fired because stop reported failure
+    finally:
+        os.remove(script_path)
+
+
+def test_cleanup_orphan_containers_removes_every_sandbox_prefixed_container():
+    """
+    Second council-audit-round finding: a run that was itself killed (the
+    whole orchestrator process, not just a single candidate's timeout)
+    never gets to run _force_stop_container at all, leaving its container
+    running indefinitely - nothing previously reclaimed it at the next
+    startup. Doesn't need a real docker daemon.
+    """
+    from sandbox.executor import cleanup_orphan_containers
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["docker", "ps", "-aq"]:
+            return MagicMock(returncode=0, stdout="abc123\ndef456\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("sandbox.executor.subprocess.run", side_effect=fake_run):
+        removed = cleanup_orphan_containers()
+
+    assert removed == 2
+    rm_calls = [c for c in calls if c[:2] == ["docker", "rm"]]
+    assert {c[-1] for c in rm_calls} == {"abc123", "def456"}
+
+
+def test_cleanup_orphan_containers_never_raises_when_docker_is_unavailable():
+    """Best-effort: Docker not being installed/running at all must not crash startup cleanup."""
+    from sandbox.executor import cleanup_orphan_containers
+
+    with patch("sandbox.executor.subprocess.run", side_effect=FileNotFoundError("no docker")):
+        removed = cleanup_orphan_containers()
+
+    assert removed == 0
 
 
 def test_run_candidate_widens_permissions_before_mounting():

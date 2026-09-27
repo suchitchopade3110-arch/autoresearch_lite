@@ -162,8 +162,7 @@ class SandboxExecutor:
             }
         except subprocess.TimeoutExpired as e:
             execution_time = time.time() - start_time
-            # explicitly stop the container to avoid orphaned processes
-            subprocess.run(["docker", "stop", container_name], capture_output=True)
+            self._force_stop_container(container_name)
             return {
                 "exit_code": -1,
                 "stdout": e.stdout.decode() if e.stdout else "",
@@ -171,6 +170,40 @@ class SandboxExecutor:
                 "execution_time": execution_time,
                 "timeout": True
             }
+
+    def _force_stop_container(self, container_name: str) -> None:
+        """
+        Second-audit-round finding: `subprocess.run`'s own timeout only
+        kills the LOCAL `docker run` client process - the docker DAEMON
+        manages the container independently and can keep it running after
+        the client disconnects, so a bare client-side kill is not
+        sufficient. `docker stop` (bounded by --time so a wedged container
+        can't make this call itself hang) sends SIGTERM then SIGKILL after
+        its grace period; `docker kill` is a fallback for the case `stop`
+        itself fails or the daemon doesn't act on it. Every call here is
+        itself bounded by `timeout=` (subprocess.run's own arg) so neither
+        can hang indefinitely if the docker daemon itself is unresponsive.
+        Best-effort and silent on failure - the caller already has a real
+        timeout result to return regardless of whether this cleanup
+        succeeds; any container this fails to reap is caught by
+        `cleanup_orphan_containers` at the next startup instead.
+        """
+        for cmd in (
+            ["docker", "stop", "--time", "5", container_name],
+            ["docker", "kill", container_name],
+        ):
+            try:
+                result = subprocess.run(cmd, capture_output=True, timeout=15)
+                if result.returncode == 0:
+                    return
+            except subprocess.TimeoutExpired:
+                continue
+        _module_logger.warning(
+            f"Could not confirm container {container_name!r} was stopped after its execution timed "
+            "out - it may still be running. It will be reaped at the next startup's crash-recovery "
+            "cleanup (see cleanup_orphan_containers) if it's still present then."
+        )
+
 
     def _out_dir_exceeds_cap(self, out_dir: str) -> "tuple[bool, int]":
         """
@@ -298,3 +331,54 @@ class SandboxExecutor:
 
         cmd.append("ml-sandbox")
         return cmd
+
+
+def cleanup_orphan_containers() -> int:
+    """
+    Removes every container named "sandbox-*" (SandboxExecutor.run_candidate's
+    own naming convention) - crash recovery for a previous orchestrator
+    process that was killed before SandboxExecutor._force_stop_container
+    ever got a chance to run, leaving a candidate's container running (or
+    merely present but stopped) indefinitely. Meant to be called once, at
+    startup, before any candidate of THIS run has been scheduled - same
+    timing contract as vcs/git_controller.py:cleanup_orphans.
+
+    A module-level function, not a SandboxExecutor method, so the
+    standalone `cleanup` subcommand (and startup cleanup in general) can
+    reap orphaned containers without constructing a full SandboxExecutor -
+    whose __init__ builds the Docker image, an expensive and unnecessary
+    step for what should be a fast, cheap cleanup pass (and one that would
+    hard-fail outright wherever Docker isn't installed at all).
+
+    CONCURRENT RUNS: containers are host-global, not scoped to a git repo
+    the way worktrees are - a second orchestrator process running on the
+    SAME HOST (even against a different repo_path) would have its own
+    in-flight candidate containers removed by this too. This is the same
+    class of risk vcs/git_controller.py:cleanup_orphans already accepts
+    and documents for concurrent runs against the same repo_path, just
+    with a wider blast radius (host-wide, not repo-scoped) - do not run
+    two orchestrator processes on the same host concurrently.
+
+    Best-effort: any docker error here (including Docker not being
+    installed/running at all) is logged and swallowed, never raised - this
+    must never block a run from starting. Returns the number of containers
+    removed.
+    """
+    try:
+        listing = subprocess.run(
+            ["docker", "ps", "-aq", "--filter", "name=^sandbox-"],
+            capture_output=True, text=True, timeout=15, check=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        _module_logger.warning(f"Could not list orphan sandbox containers for cleanup: {e}")
+        return 0
+
+    container_ids = [line for line in listing.stdout.splitlines() if line.strip()]
+    removed = 0
+    for container_id in container_ids:
+        try:
+            subprocess.run(["docker", "rm", "-f", container_id], capture_output=True, timeout=15, check=True)
+            removed += 1
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            _module_logger.warning(f"Could not remove orphan sandbox container {container_id!r}")
+    return removed

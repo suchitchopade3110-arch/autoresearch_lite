@@ -86,6 +86,31 @@ def test_api_endpoints_also_require_auth(configure_paths):
     assert client.get("/api/report").status_code == 401
 
 
+def test_a_candidates_diff_cannot_inject_script_into_the_dashboard(configure_paths):
+    """
+    Second council-audit-round finding: the judges split on whether a
+    candidate's diff, rendered next to the approve/reject buttons, could
+    contain script that runs and approves itself (one auditor rated this
+    a real self-approval vector; the other two called it speculative,
+    contingent on unescaped output). Settled here rather than left
+    ambiguous: FastAPI's Jinja2Templates autoescapes by default, and this
+    verifies it holds for the exact field a candidate fully controls -
+    req.diff - by asserting a script tag survives only HTML-escaped, never
+    as live markup the browser would execute.
+    """
+    os.environ["DASHBOARD_AUTH_DISABLED"] = "true"
+    api_main = _fresh_api_main()
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api_main.app)
+    payload = "<script>fetch('/approvals/x/approve',{method:'POST'})</script>"
+    api_main.store.create_request("cand-1", "goal", payload, 0.9, {})
+
+    r = client.get("/")
+    assert payload not in r.text
+    assert "&lt;script&gt;" in r.text
+
+
 def test_approve_without_csrf_token_is_rejected(configure_paths):
     """
     Wave 4 acceptance: the mutating approve/reject endpoints must reject a
@@ -142,6 +167,64 @@ def test_approve_with_matching_csrf_token_succeeds(configure_paths):
     r = client.post(
         f"/approvals/{req_id}/approve",
         data={"note": "ship it", "csrf_token": real_token},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert api_main.store.get_request(req_id)["status"] == "approved"
+
+
+def test_approve_with_matching_token_but_mismatched_origin_is_rejected(configure_paths):
+    """
+    Second council-audit-round finding: double-submit-cookie CSRF is
+    defeated by a "cookie fixation" attack, since browser cookies are not
+    port-isolated - a page on ANY other localhost:* port can plant its own
+    csrf_token cookie via document.cookie before this dashboard's own
+    httponly cookie has ever been set for a given browser (e.g. a
+    first-time visitor), then auto-submit a cross-port form carrying that
+    SAME planted value as the csrf_token field, producing a token that
+    "matches" the cookie despite never having been issued by this server.
+    SameSite=Strict does not stop this either (SameSite's "site" check is
+    host-based, not port-based). An Origin header naming a different
+    origin than the request's own Host must be rejected regardless of
+    whether the submitted token happens to match the cookie.
+    """
+    os.environ["DASHBOARD_AUTH_DISABLED"] = "true"
+    api_main = _fresh_api_main()
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api_main.app)
+    req_id = api_main.store.create_request("cand-1", "goal", "diff", 0.9, {})
+
+    dashboard = client.get("/")
+    real_token = dashboard.cookies.get("csrf_token")
+    assert real_token
+
+    r = client.post(
+        f"/approvals/{req_id}/approve",
+        data={"note": "forged", "csrf_token": real_token},
+        headers={"Origin": "http://localhost:9999"},  # a sibling port, not this dashboard's own origin
+        follow_redirects=False,
+    )
+    assert r.status_code == 403
+    assert api_main.store.get_request(req_id)["status"] == "pending"
+
+
+def test_approve_with_matching_token_and_matching_origin_still_succeeds(configure_paths):
+    """The Origin/Host check must not break the legitimate same-origin case - only a mismatch is rejected."""
+    os.environ["DASHBOARD_AUTH_DISABLED"] = "true"
+    api_main = _fresh_api_main()
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api_main.app)
+    req_id = api_main.store.create_request("cand-1", "goal", "diff", 0.9, {})
+
+    dashboard = client.get("/")
+    real_token = dashboard.cookies.get("csrf_token")
+
+    r = client.post(
+        f"/approvals/{req_id}/approve",
+        data={"note": "ship it", "csrf_token": real_token},
+        headers={"Origin": str(client.base_url)},
         follow_redirects=False,
     )
     assert r.status_code == 303

@@ -15,8 +15,25 @@ UNTRUSTED_OPEN = "<untrusted-candidate-output>"
 UNTRUSTED_CLOSE = "</untrusted-candidate-output>"
 
 
+def _escape_fence_delimiters(text: str) -> str:
+    """
+    Second-council-audit-round finding: the fence alone doesn't stop a
+    candidate from printing its OWN literal closing tag
+    (`</untrusted-candidate-output>`) followed by fake instructions -
+    to a model reading the raw text, that ends the fence early and makes
+    everything after it look like it's back in a trusted context, exactly
+    undoing the point of fencing it in the first place. Escaping every '<'
+    and '>' in the untrusted text (not just an exact match of the two
+    marker strings) closes this regardless of case, whitespace, or
+    wording variations a candidate might try - after this, the ONLY real
+    `<untrusted-candidate-output>`/`</untrusted-candidate-output>` tags
+    anywhere in the prompt are the ones this module itself inserts.
+    """
+    return text.replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _fence(text: str) -> str:
-    return f"{UNTRUSTED_OPEN}\n{text}\n{UNTRUSTED_CLOSE}"
+    return f"{UNTRUSTED_OPEN}\n{_escape_fence_delimiters(text)}\n{UNTRUSTED_CLOSE}"
 
 
 class PromptBuilder:

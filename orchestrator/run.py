@@ -9,7 +9,7 @@ import uuid
 from config_schema import ConfigError, load_config
 from observability.logging_config import bind, configure_logging, get_logger
 from vcs.git_controller import GitController, MergeConflict
-from sandbox.executor import SandboxExecutor
+from sandbox.executor import SandboxExecutor, cleanup_orphan_containers
 from eval.dataset import DatasetError, load_truth, resolve_dataset, write_subset
 from eval.baseline import BaselineStore
 from eval.pipeline import EvalPipeline, run_holdout_evaluation
@@ -70,6 +70,17 @@ def run_startup_cleanup(vcs: GitController, approval_store: ApprovalStore, confi
     if timed_out:
         logger.info(f"Crash recovery: timed out {timed_out} approval request(s) left pending past their deadline.")
 
+    # Second-audit-round finding: a previous run's per-candidate timeout
+    # handler (sandbox/executor.py:_force_stop_container) stops/kills its
+    # own container - but a run that was itself killed (not just a single
+    # candidate timing out) never gets the chance to run that handler at
+    # all, leaving the container running indefinitely. Best-effort and
+    # never raises - see cleanup_orphan_containers's own docstring for the
+    # concurrent-run caveat this shares with the worktree cleanup above.
+    removed_containers = cleanup_orphan_containers()
+    if removed_containers:
+        logger.info(f"Crash recovery: removed {removed_containers} orphan sandbox container(s) left by a previous run.")
+
 
 def _install_signal_handlers() -> None:
     """
@@ -104,6 +115,9 @@ def run_cleanup_command(config, logger) -> None:
     timeout_seconds = resolve_approval_config(config)["timeout_seconds"]
     timed_out = approval_store.timeout_stale_requests(timeout_seconds)
     logger.info(f"Timed out {timed_out} stale pending approval request(s).")
+
+    removed_containers = cleanup_orphan_containers()
+    logger.info(f"Removed {removed_containers} orphan sandbox container(s).")
 
 
 def main():

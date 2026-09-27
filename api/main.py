@@ -1,6 +1,7 @@
 import os
 import secrets
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -68,6 +69,41 @@ def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(_basic_au
 
 
 def _verify_csrf(request: Request, csrf_token: str) -> None:
+    """
+    Two independent checks, since each closes a different gap:
+
+    1. Origin/Referer vs Host (second council-audit-round finding). The
+       double-submit-cookie check below assumes an attacker can't make the
+       browser send a MATCHING (cookie, form-field) pair - but browser
+       cookies are not port-isolated: any other localhost:* page can plant
+       its own csrf_token cookie via `document.cookie` BEFORE this
+       dashboard's own httponly cookie has ever been set for this browser
+       (e.g. a first-time visitor, or one whose cookie expired), then
+       auto-submit a cross-port form carrying that same value as the
+       `csrf_token` field. SameSite=Strict does not stop this either, since
+       SameSite's "site" comparison is host-based and explicitly ignores
+       port. The Origin header (or Referer, when a client omits Origin on
+       a same-origin request) is different: it is set by the BROWSER
+       itself from the page that actually issued the request, and no page
+       on any other port can forge it to claim a different origin - so
+       comparing it against this request's own Host header defeats the
+       fixation attack regardless of which cookie value the attacker
+       managed to plant.
+    2. The double-submit-cookie token match, kept as defense in depth for
+       any client that strips both Origin and Referer entirely (some
+       privacy-focused proxies/extensions do) - (1) alone would fail open
+       for those, and (2) alone is what the fixation attack above defeats.
+    """
+    origin_header = request.headers.get("origin") or request.headers.get("referer")
+    if origin_header:
+        origin_host = urlparse(origin_header).netloc
+        request_host = request.headers.get("host", "")
+        if not origin_host or origin_host != request_host:
+            raise HTTPException(
+                status_code=403,
+                detail="Origin/Referer does not match Host - refusing a cross-origin form submission",
+            )
+
     cookie_token = request.cookies.get("csrf_token")
     if not cookie_token or not secrets.compare_digest(csrf_token, cookie_token):
         raise HTTPException(status_code=403, detail="Invalid or missing CSRF token")

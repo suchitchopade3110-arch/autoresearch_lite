@@ -188,6 +188,56 @@ def test_merge_never_switches_the_active_branch_when_base_ref_differs(repo_dir):
         repo.close()
 
 
+def test_merge_warns_by_name_about_a_separate_worktree_left_stale(repo_dir, caplog):
+    """
+    Second council-audit-round finding: a branch ref is shared across every
+    `git worktree` that has it checked out, not scoped to this
+    GitController's own repo_path worktree. If an operator manually added a
+    SEPARATE linked worktree (outside this harness's control) also checked
+    out on original_branch - e.g. for their own side-by-side review -
+    finalize_merge's on_target/was_dirty check only ever inspects
+    self.repo's own state, so that other worktree's index/working tree
+    silently goes stale: its `git status` then shows the merge's changes as
+    uncommitted, and committing as-is there would revert the merge. This
+    must now be caught and reported by name, not left silent.
+    """
+    repo = git.Repo(repo_dir)
+    try:
+        original_branch = repo.active_branch.name
+        # repo_path itself must detach before another worktree can check out
+        # the same branch - git enforces one worktree per checked-out branch.
+        repo.git.checkout("--detach", original_branch)
+    finally:
+        repo.close()
+
+    other_wt = tempfile.mkdtemp()
+    git.Repo(repo_dir).git.worktree("add", other_wt, original_branch)
+
+    controller = GitController(repo_dir, base_ref=original_branch)
+    branch_name, worktree_path = controller.create_branch("123")
+    with open(os.path.join(worktree_path, "test.txt"), "w") as f:
+        f.write("changed by candidate")
+    controller.commit_patch(worktree_path)
+
+    with caplog.at_level("WARNING"):
+        controller.merge(branch_name, worktree_path)
+
+    # git's own porcelain output normalizes path separators to "/" and
+    # resolves Windows 8.3 short-form path components (e.g. "SUCHIT~1") to
+    # their long form, which tempfile.mkdtemp()'s own return value does NOT
+    # do - the same discrepancy cleanup_orphans's docstring already
+    # documents. Compare on the realpath'd, forward-slash form so the
+    # assertion doesn't spuriously fail on a platform quirk unrelated to
+    # what this test actually verifies.
+    normalized_other_wt = os.path.realpath(other_wt).replace("\\", "/")
+    assert any(normalized_other_wt in record.getMessage() for record in caplog.records)
+
+    # The stale worktree's file content really is left behind, proving the
+    # warning describes a real, not hypothetical, risk.
+    with open(os.path.join(other_wt, "test.txt")) as f:
+        assert f.read() == "initial state"
+
+
 def test_merge_does_not_crash_when_main_worktree_has_uncommitted_changes(repo_dir):
     """
     Council audit finding: a dirty main working tree used to raise an

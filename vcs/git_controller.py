@@ -1,7 +1,7 @@
 import os
 import time
 import uuid
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import git
 
@@ -183,6 +183,42 @@ class GitController:
 
         return {"removed_worktrees": removed_worktrees, "removed_branches": removed_branches}
 
+    def _other_worktrees_on_branch(self, exclude_paths: Set[str]) -> List[str]:
+        """
+        Every worktree (per `git worktree list --porcelain`, the same
+        source cleanup_orphans reads) that currently has `original_branch`
+        checked out, other than the paths in `exclude_paths` (normally
+        `self.repo_path` itself and the candidate's own worktree_path being
+        removed). Used by finalize_merge to warn about a branch ref moving
+        underneath a worktree this controller doesn't manage or update -
+        see that method's docstring for why this matters. Returns absolute
+        paths; empty if none exist (the common case).
+        """
+        excluded = {os.path.abspath(p) for p in exclude_paths}
+        try:
+            listing = self.repo.git.worktree("list", "--porcelain")
+        except git.GitCommandError:
+            return []
+
+        stale: List[str] = []
+        current_path = None
+        current_branch = None
+        for line in listing.splitlines() + [""]:
+            if line.startswith("worktree "):
+                current_path = line[len("worktree "):]
+            elif line.startswith("branch refs/heads/"):
+                current_branch = line[len("branch refs/heads/"):]
+            elif line == "":
+                if (
+                    current_path
+                    and current_branch == self.original_branch
+                    and os.path.abspath(current_path) not in excluded
+                ):
+                    stale.append(current_path)
+                current_path = None
+                current_branch = None
+        return stale
+
     def _active_branch_name(self) -> Optional[str]:
         try:
             return self.repo.active_branch.name
@@ -271,6 +307,26 @@ class GitController:
         the merge without a separate `git pull`/`checkout`. Otherwise the
         working tree is left completely untouched; only the ref moves.
 
+        SECOND-AUDIT-ROUND FINDING: a branch ref is shared across every
+        `git worktree` that has it checked out - it is NOT scoped to
+        `self.repo`'s own worktree. If an operator manually added a
+        SEPARATE linked worktree (outside this GitController's own
+        worktree_root) also checked out on original_branch - e.g. for their
+        own side-by-side review - advancing the ref here moves what THAT
+        worktree's `git log` reports without touching its index/working
+        tree at all, since the `on_target`/`was_dirty` check above only
+        ever inspects `self.repo`'s own state. Left undetected, that
+        worktree's `git status` then shows the merge's changes as
+        uncommitted "modifications" - and a `git commit` made there would
+        silently *revert* the merge. Every OTHER worktree with
+        original_branch checked out (found via `git worktree list
+        --porcelain`, same technique cleanup_orphans uses) is now named
+        explicitly in a warning after the ref moves - this does not (and
+        deliberately does not) refuse the merge or touch that worktree's
+        files, since only a human working directly in it can resolve
+        whatever uncommitted state might already be there; it turns a
+        silent trap into a loud, actionable one.
+
         Raises MergeConflict if the compare-and-swap fails because
         original_branch moved concurrently since old_tip was captured
         (e.g. another candidate finalized first) - the candidate's
@@ -313,6 +369,16 @@ class GitController:
                 f"Candidate {branch_name} merged (ref advanced), but the main working tree has "
                 "uncommitted changes to tracked files - its files were left untouched. Run "
                 "`git status`/`git checkout` there to see the merge."
+            )
+
+        for stale_path in self._other_worktrees_on_branch(exclude_paths={self.repo_path, worktree_path}):
+            _module_logger.warning(
+                f"Candidate {branch_name} merged (ref advanced), and a SEPARATE worktree at "
+                f"{stale_path!r} also has {self.original_branch!r} checked out - its index/working "
+                "tree were NOT updated (this controller only ever updates its own repo_path worktree). "
+                "Running `git status` there will show the merge's changes as uncommitted; committing "
+                "as-is there would silently revert the merge. Run `git status`/`git reset --hard "
+                f"{self.original_branch}` there before doing anything else in it."
             )
 
         self.repo.git.worktree("remove", "--force", worktree_path)
