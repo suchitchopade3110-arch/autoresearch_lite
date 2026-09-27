@@ -13,7 +13,7 @@ from evolution.reporting import log_generation_report
 from observability.logging_config import bind, get_logger
 
 class EvolutionEngine:
-    def __init__(self, config: Dict[str, Any], git_controller, sandbox, evaluator, metrics_calculator, failure_analyzer, patch_generator: PatchGenerator, prompt_builder: PromptBuilder, db: ExperimentDB, approval_store=None, truth=None, baseline_store=None, run_id=None, train_path=None):
+    def __init__(self, config: Dict[str, Any], git_controller, sandbox, evaluator, metrics_calculator, failure_analyzer, patch_generator: PatchGenerator, prompt_builder: PromptBuilder, db: ExperimentDB, approval_store=None, truth=None, baseline_store=None, run_id=None, train_path=None, holdout_path=None, holdout_truth=None):
         self.config = config.get('evolution', {})
         self.full_config = config
         self.eval_config = config.get('eval', {})
@@ -32,6 +32,14 @@ class EvolutionEngine:
         # the SUBSET_PERCENTAGE env var) is mounted per stage by the
         # scheduler when this is set. See eval/dataset.py:write_subset.
         self.train_path = train_path
+        # The sealed holdout (never used by any progressive-scaling stage or
+        # the baseline gate) and its host-only truth - see
+        # eval/dataset.py:generate_split's docstring and
+        # eval/pipeline.py:run_holdout_evaluation. Both are None for a
+        # custom dataset set up without one; the scheduler skips holdout
+        # scoring gracefully in that case.
+        self.holdout_path = holdout_path
+        self.holdout_truth = holdout_truth
         self.run_id = run_id or uuid.uuid4().hex[:12]
         self.logger = get_logger(__name__, run_id=self.run_id)
 
@@ -287,6 +295,8 @@ class EvolutionEngine:
                 truth=self.truth,
                 baseline_store=self.baseline_store,
                 train_path=self.train_path,
+                holdout_path=self.holdout_path,
+                holdout_truth=self.holdout_truth,
             )
 
             scored = score_candidates(evaluated, self.config)

@@ -50,7 +50,13 @@
         <div>
           <div class="font-mono text-xs text-slate-500">{{ req.candidate_id }}</div>
           <div class="font-medium">{{ req.goal }}</div>
-          <div class="text-sm text-slate-600">score: {{ "%.4f"|format(req.final_score) }} &middot; requested {{ req.created_at }}</div>
+          <div class="text-sm text-slate-600">
+            selection score: {{ "%.4f"|format(req.final_score) }}
+            {% if req.metrics and not req.metrics.holdout_skipped %}
+              &middot; <span title="Scored once against a sealed holdout set never used to gate any merge decision - see eval/dataset.py:generate_split's docstring. A large gap below the selection score is a warning sign that the selection score has been overfit to.">holdout score: {{ "%.4f"|format(req.metrics.holdout_score) }}</span>
+            {% endif %}
+            &middot; requested {{ req.created_at }}
+          </div>
         </div>
         <div class="flex gap-2">
           <form method="post" action="/approvals/{{ req.id }}/approve">
@@ -79,7 +85,7 @@
   <div class="overflow-x-auto mb-8">
     <table class="w-full text-sm bg-white rounded-lg shadow">
       <thead class="text-left text-slate-500 border-b">
-        <tr><th class="p-2">Candidate</th><th class="p-2">Status</th><th class="p-2">Score</th><th class="p-2">Decided</th><th class="p-2">Note</th></tr>
+        <tr><th class="p-2">Candidate</th><th class="p-2">Status</th><th class="p-2">Selection score</th><th class="p-2">Holdout score</th><th class="p-2">Decided</th><th class="p-2">Note</th></tr>
       </thead>
       <tbody>
         {% for a in decided %}
@@ -93,6 +99,9 @@
               {% else %}bg-amber-100 text-amber-800{% endif %}">{{ a.status }}</span>
           </td>
           <td class="p-2">{{ "%.4f"|format(a.final_score) }}</td>
+          <td class="p-2 text-slate-500">
+            {% if a.metrics and not a.metrics.holdout_skipped %}{{ "%.4f"|format(a.metrics.holdout_score) }}{% else %}n/a{% endif %}
+          </td>
           <td class="p-2 text-xs text-slate-500">{{ a.decided_at }}</td>
           <td class="p-2 text-xs text-slate-500">{{ a.decision_note or "" }}</td>
         </tr>
@@ -106,17 +115,25 @@
   <div class="overflow-x-auto">
     <table class="w-full text-sm bg-white rounded-lg shadow">
       <thead class="text-left text-slate-500 border-b">
-        <tr><th class="p-2">Hypothesis</th><th class="p-2">Outcome</th><th class="p-2">When</th></tr>
+        <tr><th class="p-2">Hypothesis</th><th class="p-2">Outcome</th><th class="p-2">Holdout score</th><th class="p-2">When</th></tr>
       </thead>
       <tbody>
         {% for e in history %}
         <tr class="border-b last:border-0">
-          <td class="p-2">{{ e.hypothesis }}</td>
+          <td class="p-2">
+            {{ e.hypothesis }}
+            {% if e.metrics and e.metrics.rebased_after_approval %}
+              <span class="ml-1 px-1.5 py-0.5 rounded text-xs bg-amber-100 text-amber-800" title="Approved against one base, but another candidate in the same generation merged first - what actually merged is this diff rebased onto that new base (re-evaluated for real before finalizing, but not re-shown to a human for approval). See evolution/scheduler.py phase 2.">rebased after approval</span>
+            {% endif %}
+          </td>
           <td class="p-2">
             <span class="px-2 py-0.5 rounded text-xs
               {% if e.outcome == 'success' %}bg-emerald-100 text-emerald-800
               {% elif e.outcome == 'held' %}bg-amber-100 text-amber-800
               {% else %}bg-red-100 text-red-800{% endif %}">{{ e.outcome }}</span>
+          </td>
+          <td class="p-2 text-slate-500">
+            {% if e.metrics and e.metrics.holdout_skipped is defined and not e.metrics.holdout_skipped %}{{ "%.4f"|format(e.metrics.holdout_score) }}{% else %}n/a{% endif %}
           </td>
           <td class="p-2 text-xs text-slate-500">{{ e.created_at }}</td>
         </tr>

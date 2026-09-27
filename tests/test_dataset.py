@@ -24,13 +24,24 @@ def test_generate_split_produces_train_test_and_truth():
         train_rows = load_dataset(paths["train"])
         test_rows = load_dataset(paths["test"])
         truth = load_truth(paths["truth"])
+        holdout_rows = load_dataset(paths["holdout"])
+        holdout_truth = load_truth(paths["holdout_truth"])
 
         assert set(train_rows[0].keys()) == {"x1", "x2", "label"}
         assert set(test_rows[0].keys()) == {"id", "x1", "x2"}
+        assert set(holdout_rows[0].keys()) == {"id", "x1", "x2"}
         assert "label" not in test_rows[0]
+        assert "label" not in holdout_rows[0]
         assert len(test_rows) == len(truth)
-        assert len(train_rows) + len(test_rows) == 200
+        assert len(holdout_rows) == len(holdout_truth)
+        # The held-out portion (test_frac of the whole dataset) is split
+        # again between the selection set (test.jsonl) and the sealed
+        # holdout (holdout.jsonl) - see generate_split's docstring.
+        assert len(train_rows) + len(test_rows) + len(holdout_rows) == 200
         assert set(truth.keys()) == {str(r["id"]) for r in test_rows}
+        assert set(holdout_truth.keys()) == {str(r["id"]) for r in holdout_rows}
+        # Selection and holdout ids must never overlap, or "sealed" is a lie.
+        assert set(truth.keys()).isdisjoint(set(holdout_truth.keys()))
 
 
 def test_generate_split_is_deterministic():
@@ -40,6 +51,8 @@ def test_generate_split_is_deterministic():
         assert load_dataset(paths_a["train"]) == load_dataset(paths_b["train"])
         assert load_dataset(paths_a["test"]) == load_dataset(paths_b["test"])
         assert load_truth(paths_a["truth"]) == load_truth(paths_b["truth"])
+        assert load_dataset(paths_a["holdout"]) == load_dataset(paths_b["holdout"])
+        assert load_truth(paths_a["holdout_truth"]) == load_truth(paths_b["holdout_truth"])
 
 
 def test_generate_split_skips_if_exists():
@@ -181,7 +194,34 @@ def test_validate_custom_dataset_accepts_a_pre_existing_dataset_of_any_row_shape
             "train": os.path.join(d, "train.jsonl"),
             "test": os.path.join(d, "test.jsonl"),
             "truth": os.path.join(d, "truth.json"),
+            "holdout": None,
+            "holdout_truth": None,
         }
+
+
+def test_validate_custom_dataset_accepts_and_validates_an_optional_holdout_pair():
+    with tempfile.TemporaryDirectory() as d:
+        _write_custom_dataset(d)
+        with open(os.path.join(d, "holdout.jsonl"), "w") as f:
+            f.write(json.dumps({"id": 99, "feat": 5.0}) + "\n")
+        with open(os.path.join(d, "holdout_truth.json"), "w") as f:
+            json.dump({"99": "b"}, f)
+
+        paths = validate_custom_dataset(d)
+        assert paths["holdout"] == os.path.join(d, "holdout.jsonl")
+        assert paths["holdout_truth"] == os.path.join(d, "holdout_truth.json")
+
+
+def test_validate_custom_dataset_rejects_an_incomplete_holdout_pair():
+    with tempfile.TemporaryDirectory() as d:
+        _write_custom_dataset(d)
+        with open(os.path.join(d, "holdout.jsonl"), "w") as f:
+            f.write(json.dumps({"id": 99, "feat": 5.0}) + "\n")
+        # holdout_truth.json deliberately absent - a half-configured holdout
+        # can only be a setup mistake, never an intentional "skip it" signal
+        # (that signal is both files absent).
+        with pytest.raises(DatasetError, match="holdout"):
+            validate_custom_dataset(d)
 
 
 def test_validate_custom_dataset_raises_a_readable_error_when_a_file_is_missing():
@@ -199,6 +239,36 @@ def test_validate_custom_dataset_raises_on_invalid_truth_json():
         with open(os.path.join(d, "truth.json"), "w") as f:
             f.write("not valid json")
         with pytest.raises(DatasetError, match="not valid JSON"):
+            validate_custom_dataset(d)
+
+
+def test_validate_custom_dataset_raises_on_malformed_jsonl_row():
+    with tempfile.TemporaryDirectory() as d:
+        _write_custom_dataset(d)
+        with open(os.path.join(d, "test.jsonl"), "w") as f:
+            f.write("not json at all\n")
+        with pytest.raises(DatasetError, match="not valid JSON"):
+            validate_custom_dataset(d)
+
+
+def test_validate_custom_dataset_raises_when_test_rows_have_no_id_field():
+    with tempfile.TemporaryDirectory() as d:
+        _write_custom_dataset(d, test_rows=[{"feat": 2.0}], truth={"0": "a"})
+        with pytest.raises(DatasetError, match='"id"'):
+            validate_custom_dataset(d)
+
+
+def test_validate_custom_dataset_raises_when_test_and_truth_id_sets_disagree():
+    """
+    Council-audit finding: a custom dataset that validated cleanly here but
+    had mismatched ids between test.jsonl and truth.json previously
+    surfaced only once every single candidate failed scoring with a silent
+    "prediction id set mismatch" - after burning a full sandbox run. This
+    must fail fast, before any sandbox execution, naming the mismatch.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        _write_custom_dataset(d, test_rows=[{"id": 0, "feat": 2.0}, {"id": 1, "feat": 3.0}], truth={"0": "a"})
+        with pytest.raises(DatasetError, match="disagree"):
             validate_custom_dataset(d)
 
 

@@ -2,14 +2,17 @@
 # HARD INVARIANT - read this in full before changing anything in this file,
 # eval/dataset.py, or sandbox/executor.py:
 #
-#   1. truth.json (the held-out labels) is NEVER mounted into the sandbox.
-#      It is loaded host-side only, via eval/dataset.py:load_truth(), and
-#      passed into this module as an in-memory dict. No code path here (or
-#      in sandbox/executor.py) may ever construct a docker mount argument
-#      referencing truth.json, or make it readable from inside a container.
-#      truth.json lives on disk in the SAME directory as train.jsonl/
-#      test.jsonl (see eval/dataset.py:generate_split) - the only reason it
-#      stays hidden is that sandbox/executor.py mounts individual files
+#   1. truth.json AND holdout_truth.json (the held-out labels for the
+#      selection set and the sealed holdout respectively - see
+#      eval/dataset.py:generate_split's docstring) are NEVER mounted into
+#      the sandbox. Both are loaded host-side only, via
+#      eval/dataset.py:load_truth(), and passed into this module as
+#      in-memory dicts. No code path here (or in sandbox/executor.py) may
+#      ever construct a docker mount argument referencing either file, or
+#      make either readable from inside a container. Both live on disk in
+#      the SAME directory as train.jsonl/test.jsonl/holdout.jsonl (see
+#      eval/dataset.py:generate_split) - the only reason they stay hidden
+#      is that sandbox/executor.py mounts individual files
 #      (`-v host_path:container_path:ro`), never the whole directory. If
 #      that ever changes to a directory-level mount, this invariant breaks
 #      silently.
@@ -39,7 +42,10 @@ import importlib
 import json
 import os
 import re
-from typing import Any, Callable, Dict, Optional, Tuple
+import shutil
+import stat
+import tempfile
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from observability.logging_config import get_logger
 
@@ -83,9 +89,19 @@ def load_predictions(pred_path: str) -> Tuple[Optional[Dict[str, Any]], str]:
     if os.path.islink(pred_path):
         return None, "predictions file is a symlink, refusing to read it"
     try:
-        file_size = os.path.getsize(pred_path)
+        st = os.stat(pred_path)
     except OSError as e:
         return None, f"could not stat predictions file: {e}"
+    # A FIFO (named pipe) has no fixed size - os.path.getsize()/os.stat().st_size
+    # on one is 0 regardless of how much data a reader/writer holds open on
+    # the other end, so the size cap below cannot bound it. A candidate that
+    # creates one at this path and keeps a writer attached would turn the
+    # unconditional `for line in f` read below into an indefinite hang
+    # (a host-side denial of service, same family as the symlink-to-
+    # /dev/zero case the size cap already defends against).
+    if stat.S_ISFIFO(st.st_mode):
+        return None, "predictions file is a named pipe (FIFO), refusing to read it"
+    file_size = st.st_size
     if file_size > MAX_PREDICTIONS_FILE_BYTES:
         return None, f"predictions file too large ({file_size} bytes > {MAX_PREDICTIONS_FILE_BYTES} cap)"
 
@@ -221,3 +237,59 @@ class EvalPipeline:
         if not match:
             return None
         return float(match.group(1))
+
+
+def run_holdout_evaluation(
+    evaluator: "EvalPipeline",
+    sandbox: Any,
+    script_path: str,
+    train_path: str,
+    holdout_path: Optional[str],
+    holdout_truth: Optional[Dict[str, int]],
+    extra_files: Optional[List[str]] = None,
+    logger=None,
+) -> Dict[str, Any]:
+    """
+    Council-audit finding: every progressive-scaling stage and the baseline
+    gate (eval/baseline.py) score a candidate against the SAME selection
+    set (test.jsonl) every time - across many candidates and generations,
+    a merge rule of "beat the best score ever achieved on this exact
+    sample" ratchets upward on that sample's own sampling noise as much as
+    on genuine improvement. This runs a candidate ONE more time, trained on
+    the FULL training set (not a progressive-stage subset - see
+    eval/dataset.py:generate_split's docstring) and scored against the
+    sealed holdout instead, which is never used to gate anything.
+
+    Returns {"holdout_score": float, "holdout_error": str, "holdout_skipped": bool}:
+      - holdout_skipped is True (and the other two fields are 0.0/"") when
+        holdout_path/holdout_truth aren't available - a bring-your-own
+        dataset that predates the sealed holdout, or was set up without
+        one (see eval/dataset.py:validate_custom_dataset). Never raises,
+        and never itself affects a merge decision - callers must only ever
+        attach this to metrics/reporting, never to BaselineStore.
+    """
+    log = logger or _module_logger
+    if not holdout_path or not holdout_truth:
+        return {"holdout_score": 0.0, "holdout_error": "", "holdout_skipped": True}
+
+    out_dir = tempfile.mkdtemp(prefix="autoresearch-holdout-")
+    pred_path = os.path.join(out_dir, "predictions.jsonl")
+    try:
+        execution_result = sandbox.run_candidate(
+            script_path,
+            env_vars={"SUBSET_PERCENTAGE": "100"},
+            out_dir=out_dir,
+            extra_files=extra_files or None,
+            train_path_override=train_path,
+            test_path_override=holdout_path,
+        )
+        if execution_result['exit_code'] != 0 or execution_result.get('timeout', False):
+            log.info("Holdout run failed to execute cleanly - reporting holdout_score=0.0")
+            return {"holdout_score": 0.0, "holdout_error": "holdout execution failed or timed out", "holdout_skipped": False}
+
+        score, reason = evaluator.score_predictions(pred_path, holdout_truth)
+        if reason:
+            log.info(f"Holdout scoring failed: {reason}")
+        return {"holdout_score": score, "holdout_error": reason, "holdout_skipped": False}
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)

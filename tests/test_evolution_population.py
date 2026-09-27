@@ -80,6 +80,55 @@ def test_duplicate_exhaustion_produces_a_record_and_never_touches_the_sandbox(tm
     assert len(exhausted) == 2
 
 
+class _OutOfScopeDiffClient(LLMClient):
+    """A stub LLM client that always proposes a diff touching a file outside target.files."""
+    def generate_diff(self, prompt, target_file, current_content=""):
+        return (
+            "--- a/eval/pipeline.py\n+++ b/eval/pipeline.py\n@@ -1,1 +1,1 @@\n-old\n+return 1.0, ''\n"
+        )
+
+
+def test_generate_candidate_rejects_a_diff_out_of_target_files_scope(tmp_dir):
+    """
+    Council-audit finding: evolutionary mode's candidate generation calls
+    LLMClient.generate_diff() directly rather than going through
+    PatchGenerator.generate_and_apply() (see this module's own docstring on
+    _generate_candidate) - that bypasses the multi-file WRAPPER, not the
+    diff-scope GUARD. _generate_candidate's own dry-run call to
+    validate_and_apply_patch still passes allowed_files=
+    ["candidate_script.py"], so a diff touching any other path (e.g.
+    rewriting eval/pipeline.py to always return a perfect score) must be
+    rejected here exactly like a malformed diff, exhausting retries and
+    rolling back the worktree - never silently applied.
+    """
+    repo_dir = _init_repo(tmp_dir)
+    git_controller = GitController(repo_path=repo_dir, worktree_root=os.path.join(tmp_dir, "worktrees"))
+
+    db = ExperimentDB(db_path=os.path.join(tmp_dir, "chroma"))
+    prompt_builder = PromptBuilder(db, {})
+    patch_generator = PatchGenerator(_OutOfScopeDiffClient())
+
+    config = {"evolution": {"duplicate_threshold": 0.25}, "eval": {"stages": []}}
+    engine = EvolutionEngine(
+        config=config,
+        git_controller=git_controller,
+        sandbox=MagicMock(),
+        evaluator=None,
+        metrics_calculator=calculate_all_metrics,
+        failure_analyzer=analyze_failure,
+        patch_generator=patch_generator,
+        prompt_builder=prompt_builder,
+        db=db,
+    )
+
+    branches_before = {h.name for h in git_controller.repo.heads}
+    candidate = engine._generate_candidate("goal")
+
+    assert candidate is None
+    branches_after = {h.name for h in git_controller.repo.heads}
+    assert branches_after == branches_before  # the rejected candidate's branch/worktree was rolled back
+
+
 def test_generate_candidate_creates_and_cleans_up_worktree_on_exhaustion(tmp_dir):
     """
     Wave 2.3: _generate_candidate creates the candidate's worktree before

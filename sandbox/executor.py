@@ -36,6 +36,15 @@ class SandboxExecutor:
         self.pids_limit = config.get('pids_limit', 128)
         self.ulimit_nofile = config.get('ulimit_nofile', 1024)
         self.tmpfs_size_mb = config.get('tmpfs_size_mb', 64)
+        # /app/out is a real host bind mount (rw), not a tmpfs - Docker has
+        # no --tmpfs-style size flag for a bind mount, so nothing on the
+        # `docker run` command line can cap it the way tmpfs_size_mb caps
+        # /tmp. A candidate that writes large junk files into it (beyond
+        # predictions.jsonl itself, which eval/pipeline.py already caps at
+        # MAX_PREDICTIONS_FILE_BYTES before reading it) could otherwise fill
+        # host disk with no limit at all. Enforced host-side, after the
+        # container exits, by summing out_dir's real file sizes.
+        self.out_dir_max_mb = config.get('out_dir_max_mb', 256)
         # Opt-in only, never enabled by default - GPU passthrough (via the
         # NVIDIA Container Toolkit) is an isolation trade-off the operator
         # must choose explicitly, not something this harness should decide
@@ -77,7 +86,8 @@ class SandboxExecutor:
 
     def run_candidate(self, script_path: str, env_vars: Optional[Dict[str, str]] = None,
                        out_dir: Optional[str] = None, extra_files: Optional[List[str]] = None,
-                       train_path_override: Optional[str] = None) -> Dict[str, Any]:
+                       train_path_override: Optional[str] = None,
+                       test_path_override: Optional[str] = None) -> Dict[str, Any]:
         """
         Runs the given script inside the docker sandbox. extra_files are
         additional worktree paths (for multi-file candidates - see
@@ -96,6 +106,20 @@ class SandboxExecutor:
         test.jsonl is never subsetted - the test set stays whole at every
         stage so scores remain comparable across stages (see
         eval/dataset.py:subset_indices).
+
+        test_path_override, if given, is mounted at /app/data/test.jsonl
+        INSTEAD OF dataset_dir/test.jsonl - used for exactly one purpose:
+        the sealed-holdout evaluation run (see eval/dataset.py's
+        generate_split docstring and orchestrator/run.py's
+        _score_holdout). Every progressive-scaling stage during the loop
+        itself sees the SAME test.jsonl (the "selection" set) every time,
+        by design - repeatedly gating merge decisions on one fixed set lets
+        the baseline ratchet upward on that set's own sampling noise rather
+        than genuine improvement. The holdout set is scored exactly once,
+        after a candidate has already cleared every stage and the baseline
+        gate on the selection set, and that holdout score is never itself
+        used to gate anything - it is reported alongside the selection
+        score for a human reviewer (or an auditor) to see the difference.
         """
         start_time = time.time()
         container_name = f"sandbox-{uuid.uuid4().hex[:8]}"
@@ -103,6 +127,7 @@ class SandboxExecutor:
         cmd = self._build_docker_cmd(
             script_path, container_name, env_vars=env_vars, out_dir=out_dir,
             extra_files=extra_files, train_path_override=train_path_override,
+            test_path_override=test_path_override,
         )
 
         try:
@@ -113,6 +138,21 @@ class SandboxExecutor:
                 timeout=self.timeout
             )
             execution_time = time.time() - start_time
+
+            if out_dir is not None:
+                oversized, out_dir_size = self._out_dir_exceeds_cap(out_dir)
+                if oversized:
+                    return {
+                        "exit_code": -1,
+                        "stdout": result.stdout,
+                        "stderr": (
+                            f"Candidate wrote {out_dir_size} bytes to /app/out, exceeding the "
+                            f"{self.out_dir_max_mb}MB cap - execution result discarded."
+                        ),
+                        "execution_time": execution_time,
+                        "timeout": False,
+                    }
+
             return {
                 "exit_code": result.returncode,
                 "stdout": result.stdout,
@@ -132,10 +172,38 @@ class SandboxExecutor:
                 "timeout": True
             }
 
+    def _out_dir_exceeds_cap(self, out_dir: str) -> "tuple[bool, int]":
+        """
+        Sums the real on-disk size of every regular file under out_dir
+        (the sandbox's rw /app/out bind mount) and compares it against
+        out_dir_max_mb. Symlinks are not followed (os.walk's default
+        followlinks=False, and os.path.getsize on a symlink reports the
+        link's own tiny size, never the target's) - a candidate trying to
+        inflate the reported size via a symlink to a large host file gains
+        nothing here; the real defense against a symlink at this path is
+        the file-safety check in eval/pipeline.py:load_predictions and the
+        symlink guard in _build_docker_cmd above. Returns (exceeded, total_bytes).
+        """
+        cap_bytes = self.out_dir_max_mb * 1024 * 1024
+        total = 0
+        for root, _dirs, files in os.walk(out_dir):
+            for name in files:
+                path = os.path.join(root, name)
+                if os.path.islink(path):
+                    continue
+                try:
+                    total += os.path.getsize(path)
+                except OSError:
+                    continue
+                if total > cap_bytes:
+                    return True, total
+        return False, total
+
     def _build_docker_cmd(self, script_path: str, container_name: str,
                            env_vars: Optional[Dict[str, str]] = None,
                            out_dir: Optional[str] = None, extra_files: Optional[List[str]] = None,
-                           train_path_override: Optional[str] = None) -> List[str]:
+                           train_path_override: Optional[str] = None,
+                           test_path_override: Optional[str] = None) -> List[str]:
         """
         Builds the full `docker run` argument list for one candidate
         execution - every bind mount `run_candidate` passes to Docker is
@@ -164,6 +232,8 @@ class SandboxExecutor:
                 raise ValueError(f"Refusing to mount a symlink into the sandbox: {candidate_path}")
         if train_path_override and os.path.islink(train_path_override):
             raise ValueError(f"Refusing to mount a symlink into the sandbox: {train_path_override}")
+        if test_path_override and os.path.islink(test_path_override):
+            raise ValueError(f"Refusing to mount a symlink into the sandbox: {test_path_override}")
 
         # A bind mount carries the HOST file's real permission bits into the
         # container - the sandbox's UID (1000) is never the host process's
@@ -203,9 +273,9 @@ class SandboxExecutor:
             train_path = train_path_override or os.path.join(self.dataset_dir, "train.jsonl")
             cmd += ["-v", f"{os.path.abspath(train_path)}:/app/data/train.jsonl:ro"]
             run_env.setdefault("TRAIN_PATH", "/app/data/train.jsonl")
-        if self.dataset_dir:
-            test_path = os.path.join(self.dataset_dir, "test.jsonl")
-            cmd += ["-v", f"{test_path}:/app/data/test.jsonl:ro"]
+        if self.dataset_dir or test_path_override:
+            test_path = test_path_override or os.path.join(self.dataset_dir, "test.jsonl")
+            cmd += ["-v", f"{os.path.abspath(test_path)}:/app/data/test.jsonl:ro"]
             run_env.setdefault("TEST_PATH", "/app/data/test.jsonl")
 
         if out_dir:

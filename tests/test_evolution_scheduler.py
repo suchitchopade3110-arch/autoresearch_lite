@@ -3,6 +3,7 @@ import subprocess
 from unittest.mock import MagicMock
 
 from approval.store import ApprovalStore
+from eval.pipeline import EvalPipeline
 from evolution.scheduler import ConcurrentScheduler
 from vcs.git_controller import GitController
 
@@ -133,6 +134,118 @@ def test_syntax_error_is_rejected_before_ever_reaching_the_sandbox(tmp_dir):
     assert sandbox_calls == []
     assert evaluated[0]["eval_passed"] is False
     assert evaluated[0]["failure_category"] == "syntax_error"
+
+
+def test_out_of_scope_diff_is_rejected_before_ever_reaching_the_sandbox(tmp_dir):
+    """
+    Council-audit finding: evolutionary mode generates candidates by calling
+    LLMClient.generate_diff() directly (bypassing PatchGenerator.
+    generate_and_apply(), the multi-file wrapper - see evolution/
+    population.py's own docstring) rather than the sequential path's
+    higher-level call. That bypass is real, but it does NOT mean the
+    diff-scope guard (vcs/diff_guard.py) is skipped: evolve_only() below
+    still calls validate_and_apply_patch(..., allowed_files=
+    ["candidate_script.py"]) directly - the same choke point diff_guard.py
+    is wired into regardless of caller. A diff that touches a file outside
+    target.files (e.g. rewriting the harness's own eval/pipeline.py to
+    always pass) must be rejected here too, never applied, never reaching
+    the sandbox.
+    """
+    repo_dir = _init_repo(tmp_dir)
+    git_controller = GitController(repo_dir, worktree_root=os.path.join(tmp_dir, "worktrees"))
+
+    sandbox_calls = []
+
+    class RecordingSandbox:
+        def run_candidate(self, script_path, env_vars=None, out_dir=None):
+            sandbox_calls.append(script_path)
+            return {"exit_code": 0, "stdout": "", "stderr": "", "execution_time": 0.01, "timeout": False}
+
+    store = ApprovalStore(os.path.join(tmp_dir, "approvals.db"))
+    evaluator = MagicMock()
+    evaluator.evaluate_stage.return_value = (True, 1.0, False)
+
+    out_of_scope_diff = (
+        "--- a/eval/pipeline.py\n"
+        "+++ b/eval/pipeline.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-old\n"
+        "+return 1.0, ''\n"
+    )
+    candidates = [{"id": "aaa", "diff": out_of_scope_diff, "goal": "g"}]
+    scheduler = ConcurrentScheduler(max_workers=1)
+
+    evaluated = scheduler.execute_generation(
+        candidates,
+        eval_stages=[{"subset_percentage": 100, "threshold": 0.5}],
+        git_controller=git_controller,
+        sandbox=RecordingSandbox(),
+        evaluator=evaluator,
+        metrics_calculator=lambda r: {},
+        failure_analyzer=lambda r, passed: ("failure", ""),
+        approval_store=store,
+        approval_config={"approval": {"enabled": False}},
+        truth={"0": 1},
+    )
+
+    assert sandbox_calls == []
+    assert evaluated[0]["eval_passed"] is False
+    assert evaluated[0]["success"] is False
+
+
+def test_a_candidate_that_passes_gets_scored_against_the_sealed_holdout(tmp_dir):
+    """
+    Council-audit finding: the baseline gate re-uses the same selection set
+    (test.jsonl) on every merge decision across every candidate and
+    generation, letting it ratchet upward on that set's own sampling
+    noise. A candidate that clears every stage AND the baseline gate must
+    additionally be scored once against a SEPARATE sealed holdout when one
+    is configured - that score is attached to metrics for reporting/the
+    dashboard, purely informational (never fed back into baseline_store).
+    """
+    repo_dir = _init_repo(tmp_dir)
+    git_controller = GitController(repo_dir, worktree_root=os.path.join(tmp_dir, "worktrees"))
+
+    holdout_calls = []
+
+    class RecordingSandbox:
+        def run_candidate(self, script_path, env_vars=None, out_dir=None, extra_files=None,
+                           train_path_override=None, test_path_override=None):
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, "predictions.jsonl"), "w") as f:
+                if test_path_override:
+                    holdout_calls.append(test_path_override)
+                    f.write('{"id": "50", "pred": 1}\n')  # matches holdout_truth below
+                else:
+                    f.write('{"id": "0", "pred": 1}\n')
+            return {"exit_code": 0, "stdout": "", "stderr": "", "execution_time": 0.01, "timeout": False}
+
+    store = ApprovalStore(os.path.join(tmp_dir, "approvals.db"))
+    evaluator = EvalPipeline({"stages": [{"subset_percentage": 100, "threshold": 0.5}]})
+
+    diff = "--- a/candidate_script.py\n+++ b/candidate_script.py\n@@ -1 +1 @@\n-\n+print('hi')\n"
+    candidates = [{"id": "aaa", "diff": diff, "goal": "g"}]
+    scheduler = ConcurrentScheduler(max_workers=1)
+
+    evaluated = scheduler.execute_generation(
+        candidates,
+        eval_stages=[{"subset_percentage": 100, "threshold": 0.5}],
+        git_controller=git_controller,
+        sandbox=RecordingSandbox(),
+        evaluator=evaluator,
+        metrics_calculator=lambda r: {},
+        failure_analyzer=lambda r, passed: ("failure", ""),
+        approval_store=store,
+        approval_config={"approval": {"enabled": False}},
+        truth={"0": 1},
+        holdout_path="/fake/holdout.jsonl",
+        holdout_truth={"50": 1},
+    )
+
+    assert holdout_calls == ["/fake/holdout.jsonl"]
+    assert evaluated[0]["eval_passed"] is True
+    assert evaluated[0]["metrics"]["holdout_score"] == 1.0
+    assert evaluated[0]["metrics"]["holdout_skipped"] is False
 
 
 def test_progressive_stages_mount_a_host_selected_subset_not_the_full_train_file(tmp_dir):
@@ -422,3 +535,13 @@ def test_phase2_reevaluates_when_the_base_moved_since_phase1_scored_it(tmp_dir):
     # aaa: 1 phase-1 run. bbb: 1 phase-1 run + 1 phase-2 re-evaluation run
     # (its base moved once aaa finalized first).
     assert run_count["n"] == 3
+
+    # Council-audit finding: a human approves bbb's diff after seeing it
+    # evaluated against the base it was created from - but aaa's merge
+    # finalizing first means bbb's diff actually ships rebased onto a
+    # DIFFERENT base than what was shown for approval. aaa (whose base
+    # never moved) must show no rebase; bbb must show the transparency
+    # fields recording that it did.
+    assert by_id["aaa"]["metrics"]["rebased_after_approval"] is False
+    assert by_id["bbb"]["metrics"]["rebased_after_approval"] is True
+    assert by_id["bbb"]["metrics"]["approved_base_commit"] != by_id["bbb"]["metrics"]["merged_base_commit"]

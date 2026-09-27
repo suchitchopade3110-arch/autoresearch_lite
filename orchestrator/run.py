@@ -12,7 +12,7 @@ from vcs.git_controller import GitController, MergeConflict
 from sandbox.executor import SandboxExecutor
 from eval.dataset import DatasetError, load_truth, resolve_dataset, write_subset
 from eval.baseline import BaselineStore
-from eval.pipeline import EvalPipeline
+from eval.pipeline import EvalPipeline, run_holdout_evaluation
 from orchestrator.metrics import calculate_all_metrics
 
 # Phase 2 imports
@@ -156,14 +156,19 @@ def main():
             n=dataset_cfg.get('size', 1000),
             seed=dataset_cfg.get('seed'),
             test_frac=dataset_cfg.get('test_frac', 0.25),
+            holdout_frac=dataset_cfg.get('holdout_frac', 0.5),
         )
     except DatasetError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
-    # truth.json is loaded host-side only - it is never mounted into the
-    # sandbox (see sandbox/executor.py), so a candidate can never read its
-    # own answer key off disk.
+    # truth.json/holdout_truth.json are loaded host-side only - neither is
+    # ever mounted into the sandbox (see sandbox/executor.py), so a
+    # candidate can never read its own answer key off disk. holdout_truth
+    # is None when a custom dataset was set up without a sealed holdout
+    # (see eval/dataset.py:validate_custom_dataset) - run_holdout_evaluation
+    # skips gracefully in that case rather than failing the run.
     truth = load_truth(dataset_paths['truth'])
+    holdout_truth = load_truth(dataset_paths['holdout_truth']) if dataset_paths.get('holdout_truth') else None
 
     # Initialize components. target.repo_path lets the repo under evolution
     # be a separate checkout from the harness's own repository; it defaults
@@ -241,6 +246,8 @@ def main():
             baseline_store=baseline_store,
             run_id=run_id,
             train_path=dataset_paths['train'],
+            holdout_path=dataset_paths.get('holdout'),
+            holdout_truth=holdout_truth,
         )
         engine.run(args.goal)
         generate_report(db, approval_store, logger=logger)
@@ -430,6 +437,29 @@ def main():
             metrics['generation_input_tokens'] = generation_usage.get('input_tokens', 0)
             metrics['generation_output_tokens'] = generation_usage.get('output_tokens', 0)
             metrics['generation_cost_usd'] = generation_usage.get('estimated_cost_usd', 0.0)
+
+        # 4c. Sealed-holdout evaluation - only for a candidate that's
+        # actually about to be offered for approval (never for one already
+        # rejected by a stage threshold or the baseline gate above, so this
+        # never spends a sandbox run on a candidate that can't merge
+        # anyway). Scored against holdout.jsonl/holdout_truth.json, which
+        # were NEVER used by any stage above or by the baseline gate - see
+        # eval/dataset.py:generate_split's docstring for why repeatedly
+        # gating on the same selection set risks ratcheting upward on that
+        # set's own sampling noise. This score is purely informational: it
+        # is attached to metrics/reporting for a human reviewer (and an
+        # auditor) to see, and is never itself fed into BaselineStore or
+        # any auto-approve criterion.
+        if eval_passed:
+            holdout_result = run_holdout_evaluation(
+                evaluator, sandbox, script_path, dataset_paths['train'],
+                dataset_paths.get('holdout'), holdout_truth,
+                extra_files=extra_file_paths, logger=candidate_logger,
+            )
+            metrics['holdout_score'] = holdout_result['holdout_score']
+            metrics['holdout_skipped'] = holdout_result['holdout_skipped']
+            if holdout_result['holdout_error']:
+                candidate_logger.info(f"Holdout scoring note: {holdout_result['holdout_error']}")
 
         # 5. Analyze failure and log to Memory
         if below_baseline:

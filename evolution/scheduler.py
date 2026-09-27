@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from approval.gate import await_approval_decision, create_approval_request, maybe_auto_approve
 from approval.store import ApprovalStore
 from eval.dataset import write_subset
+from eval.pipeline import run_holdout_evaluation
 from generation.patch_generator import validate_and_apply_patch
 from generation.static_check import check_syntax_multi
 from observability.logging_config import bind, get_logger
@@ -128,7 +129,9 @@ class ConcurrentScheduler:
                           approval_config: Optional[Dict[str, Any]] = None,
                           truth: Optional[Dict[str, int]] = None,
                           baseline_store=None,
-                          train_path: Optional[str] = None) -> List[Dict[str, Any]]:
+                          train_path: Optional[str] = None,
+                          holdout_path: Optional[str] = None,
+                          holdout_truth: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
         """
         Two phases, so a human is never a bottleneck on the sandbox pool:
 
@@ -291,6 +294,27 @@ class ConcurrentScheduler:
                 # require_no_failure_flags criterion - see
                 # orchestrator/run.py's sequential-path equivalent.
                 all_metrics['score_claim_mismatch'] = has_failure_flags
+
+                # Sealed-holdout evaluation - only for a candidate that
+                # actually cleared every stage AND the baseline gate above
+                # (never spend a sandbox run on one that can't be offered
+                # for approval anyway). See orchestrator/run.py's
+                # sequential-path equivalent and
+                # eval/pipeline.py:run_holdout_evaluation for the full
+                # rationale - this score is purely informational and is
+                # never fed into baseline_store or any auto-approve
+                # criterion.
+                if eval_passed:
+                    holdout_result = run_holdout_evaluation(
+                        evaluator, sandbox, script_path, train_path,
+                        holdout_path, holdout_truth,
+                        logger=candidate_logger,
+                    )
+                    all_metrics['holdout_score'] = holdout_result['holdout_score']
+                    all_metrics['holdout_skipped'] = holdout_result['holdout_skipped']
+                    if holdout_result['holdout_error']:
+                        candidate_logger.info(f"Holdout scoring note: {holdout_result['holdout_error']}")
+
                 generation_usage = candidate.get('generation_usage') or {}
                 if generation_usage:
                     all_metrics['generation_input_tokens'] = generation_usage.get('input_tokens', 0)
@@ -426,6 +450,25 @@ class ConcurrentScheduler:
 
                 final_score = c['final_score']
                 last_subset = c.get('last_subset')
+
+                # Council-audit finding: a human approves a candidate's diff
+                # after seeing it evaluated against base_commit_at_eval, but
+                # if the base moved before finalization (another candidate
+                # in this generation merged first), what actually ships is
+                # that SAME diff rebased onto a DIFFERENT base - a human
+                # never explicitly reviewed that combination. Re-evaluating
+                # below (when the base moved) checks the CODE still passes,
+                # but doesn't retroactively make the original approval cover
+                # the rebased result. Recorded transparently into metrics
+                # rather than silently treated as equivalent to what was
+                # approved - visible in the stored experiment and reporting
+                # even though the merge still proceeds automatically (a
+                # second full human-approval round per rebase would defeat
+                # the two-phase scheduler's entire point of not blocking the
+                # sandbox pool on a human).
+                c['metrics']['approved_base_commit'] = c.get('base_commit_at_eval')
+                c['metrics']['merged_base_commit'] = old_tip
+                c['metrics']['rebased_after_approval'] = c.get('base_commit_at_eval') != old_tip
 
                 # The base moved since phase 1 scored this candidate (an
                 # earlier candidate in this same generation finalized in

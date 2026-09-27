@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from eval.pipeline import EvalPipeline
+from eval.pipeline import EvalPipeline, run_holdout_evaluation
 
 CONFIG = {"stages": [
     {"subset_percentage": 1, "threshold": 0.5},
@@ -171,6 +171,27 @@ def test_score_predictions_refuses_a_symlinked_predictions_file(tmp_dir):
     assert "symlink" in reason
 
 
+def test_score_predictions_refuses_a_named_pipe_predictions_file(tmp_dir):
+    """
+    Council-audit finding: a FIFO (named pipe) at predictions.jsonl has no
+    fixed size - os.stat().st_size on one is always 0, so it defeats the
+    size cap the same way a symlink to /dev/zero would defeat it, and a
+    candidate holding a writer open on the other end turns the host-side
+    `for line in f` read into an indefinite hang rather than a fast error.
+    Must be refused before any read is attempted, same as a symlink.
+    """
+    pred_path = os.path.join(tmp_dir, "predictions.jsonl")
+    try:
+        os.mkfifo(pred_path)
+    except (AttributeError, OSError, NotImplementedError):
+        pytest.skip("os.mkfifo not available in this environment")
+
+    pipeline = EvalPipeline(CONFIG)
+    score, reason = pipeline.score_predictions(pred_path, TRUTH)
+    assert score == 0.0
+    assert "pipe" in reason or "fifo" in reason.lower()
+
+
 def test_score_predictions_refuses_an_oversized_predictions_file(tmp_dir, monkeypatch):
     """A regular (non-symlink) file that is simply huge must also be refused, not read in full."""
     from eval import pipeline as pipeline_module
@@ -249,3 +270,85 @@ def test_eval_pipeline_rejects_a_scorer_module_that_does_not_exist():
 def test_eval_pipeline_rejects_a_scorer_function_that_does_not_exist():
     with pytest.raises(ValueError, match="no attribute"):
         EvalPipeline({**CONFIG, "scorer": "tests.test_eval_pipeline:no_such_function"})
+
+
+class _FakeHoldoutSandbox:
+    """Writes a fixed set of predictions to out_dir, as if a real container had run and exited 0."""
+    def __init__(self, preds):
+        self.preds = preds
+        self.calls = []
+
+    def run_candidate(self, script_path, env_vars=None, out_dir=None, extra_files=None,
+                       train_path_override=None, test_path_override=None):
+        self.calls.append({
+            "env_vars": env_vars, "extra_files": extra_files,
+            "train_path_override": train_path_override, "test_path_override": test_path_override,
+        })
+        with open(os.path.join(out_dir, "predictions.jsonl"), "w") as f:
+            for row in self.preds:
+                f.write(json.dumps(row) + "\n")
+        return {"exit_code": 0, "stdout": "", "stderr": "", "execution_time": 0.01, "timeout": False}
+
+
+def test_run_holdout_evaluation_scores_against_holdout_truth_using_full_training_data():
+    """
+    Council-audit finding: the baseline gate re-uses the same selection set
+    (test.jsonl) on every merge decision, letting it ratchet upward on that
+    set's own sampling noise. run_holdout_evaluation scores a candidate
+    exactly once against a SEPARATE sealed holdout, using the full
+    (unsubsetted) training file rather than any progressive-scaling
+    subset - this asserts both that the real score comes back correctly
+    AND that the sandbox call was actually wired the right way (100% train,
+    holdout mounted in place of test.jsonl).
+    """
+    pipeline = EvalPipeline(CONFIG)
+    holdout_truth = {"10": 1, "11": 0}
+    sandbox = _FakeHoldoutSandbox(preds=[{"id": 10, "pred": 1}, {"id": 11, "pred": 1}])
+
+    result = run_holdout_evaluation(
+        pipeline, sandbox, script_path="/fake/candidate_script.py",
+        train_path="/fake/train.jsonl", holdout_path="/fake/holdout.jsonl", holdout_truth=holdout_truth,
+    )
+
+    assert result["holdout_skipped"] is False
+    assert result["holdout_score"] == 0.5  # 1 of 2 correct
+    assert sandbox.calls[0]["train_path_override"] == "/fake/train.jsonl"
+    assert sandbox.calls[0]["test_path_override"] == "/fake/holdout.jsonl"
+    assert sandbox.calls[0]["env_vars"]["SUBSET_PERCENTAGE"] == "100"
+
+
+def test_run_holdout_evaluation_is_skipped_gracefully_when_holdout_is_unavailable():
+    """
+    A bring-your-own custom dataset that predates the sealed holdout (or
+    was set up without one) must not crash or fail the candidate - it
+    simply reports that holdout scoring was skipped, never touching the
+    sandbox at all.
+    """
+    pipeline = EvalPipeline(CONFIG)
+    sandbox = _FakeHoldoutSandbox(preds=[])
+
+    result = run_holdout_evaluation(
+        pipeline, sandbox, script_path="/fake/candidate_script.py",
+        train_path="/fake/train.jsonl", holdout_path=None, holdout_truth=None,
+    )
+
+    assert result == {"holdout_score": 0.0, "holdout_error": "", "holdout_skipped": True}
+    assert sandbox.calls == []
+
+
+def test_run_holdout_evaluation_never_gates_on_a_failed_holdout_execution():
+    """A holdout execution that crashes reports holdout_score=0.0 with a reason - it must never raise."""
+    pipeline = EvalPipeline(CONFIG)
+
+    class _FailingSandbox:
+        def run_candidate(self, script_path, **kwargs):
+            return {"exit_code": 1, "stdout": "", "stderr": "boom", "execution_time": 0.01, "timeout": False}
+
+    result = run_holdout_evaluation(
+        pipeline, _FailingSandbox(), script_path="/fake/candidate_script.py",
+        train_path="/fake/train.jsonl", holdout_path="/fake/holdout.jsonl", holdout_truth={"0": 1},
+    )
+
+    assert result["holdout_skipped"] is False
+    assert result["holdout_score"] == 0.0
+    assert result["holdout_error"]

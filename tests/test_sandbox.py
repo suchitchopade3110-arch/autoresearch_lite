@@ -430,6 +430,46 @@ def test_run_candidate_refuses_a_symlinked_out_dir():
             os.remove(script_path)
 
 
+def test_run_candidate_rejects_execution_when_out_dir_exceeds_the_size_cap():
+    """
+    Council-audit finding: /app/out is a real host bind mount (rw), not a
+    tmpfs - unlike /tmp, Docker has no --tmpfs-style flag that can cap a
+    bind mount's size on the `docker run` command line itself.
+    eval/pipeline.py's own size cap only bounds a host-side READ of
+    predictions.jsonl; nothing previously stopped a candidate from writing
+    other, arbitrarily large files into /app/out and filling host disk.
+    Enforced here, host-side, after the (mocked) container "exits": a
+    subprocess.run mock cannot actually write into out_dir the way a real
+    container would, so this writes the oversized file directly to
+    simulate what a real run would have left behind, then asserts
+    run_candidate reports a failure (non-zero exit code) instead of
+    silently succeeding with an unbounded out_dir.
+    """
+    with tempfile.NamedTemporaryFile(suffix='.py', delete=False) as f:
+        script_path = f.name
+
+    with tempfile.TemporaryDirectory() as parent:
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        # Simulate a candidate that wrote far more than the cap allows.
+        with open(os.path.join(out_dir, "junk.bin"), "wb") as junk:
+            junk.write(b"\0" * (2 * 1024 * 1024))
+
+        try:
+            with patch("sandbox.executor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+                executor = SandboxExecutor(
+                    {'timeout_seconds': 10, 'cpu_limit': "0.5", 'memory_limit': "256m", 'out_dir_max_mb': 1},
+                    dataset_dir=None,
+                )
+                result = executor.run_candidate(script_path, out_dir=out_dir)
+
+            assert result['exit_code'] != 0
+            assert "MB cap" in result['stderr']
+        finally:
+            os.remove(script_path)
+
+
 def test_run_candidate_widens_permissions_before_mounting():
     """
     Wave 4 acceptance (CI regression): a bind mount carries the HOST file's

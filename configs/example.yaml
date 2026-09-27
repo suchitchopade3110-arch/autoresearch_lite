@@ -20,6 +20,13 @@ sandbox:
   pids_limit: 128
   ulimit_nofile: 1024
   tmpfs_size_mb: 64
+  # /app/out is a real host bind mount (rw), not a tmpfs - Docker has no
+  # --tmpfs-style size flag for a bind mount, so nothing on the docker run
+  # command line can cap it the way tmpfs_size_mb caps /tmp. Enforced
+  # host-side instead: a candidate that writes more than this many MB total
+  # into /app/out (across all files, not just predictions.jsonl) has its
+  # execution result discarded as a failure.
+  out_dir_max_mb: 256
   # Opt-in only - GPU passthrough is an isolation trade-off you must choose
   # explicitly (requires the NVIDIA Container Toolkit on the host). Unset
   # by default, meaning no GPU access at all. Uncomment and pass a value
@@ -41,6 +48,20 @@ dataset:
   # eval/dataset.py:generate_split's docstring. Only set this to a fixed
   # value for a reproducible test fixture, never for a real run.
   test_frac: 0.25
+  # The held-out portion (test_frac of the whole dataset) is split AGAIN
+  # into a "selection" set (test.jsonl - what every progressive-scaling
+  # stage and the baseline gate actually score against) and a sealed
+  # "holdout" set (holdout.jsonl - scored exactly once, after a candidate
+  # has already cleared every stage, and NEVER used to gate a merge
+  # decision). holdout_frac is the fraction OF THE HELD-OUT PORTION, not of
+  # the whole dataset. This exists because gating every merge decision on
+  # the SAME selection set, repeatedly, across many candidates and
+  # generations, ratchets the "best known score" upward on that set's own
+  # sampling noise as much as on genuine improvement - the holdout score
+  # (shown on the dashboard alongside the selection score) is a much more
+  # honest estimate of real generalization precisely because it was never
+  # used to buy the merge.
+  holdout_frac: 0.5
 
 eval:
   stages:
@@ -54,6 +75,20 @@ eval:
       threshold: 0.8
   # A merge requires score > baseline + min_improvement, not just
   # score >= threshold - see eval/baseline.py.
+  #
+  # CHOOSE THIS RELATIVE TO YOUR SELECTION SET'S SAMPLING NOISE, not as a
+  # fixed small number. A binary-accuracy score measured on n held-out rows
+  # has a standard error of roughly sqrt(p*(1-p)/n) - e.g. at n=250 (this
+  # config's default test_frac/holdout_frac on the 1000-row default
+  # dataset) and p~0.9, that's roughly 0.019 (about 2 points). The default
+  # 0.001 here is far smaller than that noise floor: on a task already near
+  # its achievable ceiling, a min_improvement this small will merge
+  # candidates that are indistinguishable from noise from the one they
+  # "beat", not real improvement. Set it to at least one, ideally several,
+  # standard errors of your actual dataset/metric before treating a merge
+  # decision as evidence of genuine improvement - the holdout_frac split
+  # above gives you a second, unused-for-gating score to sanity-check this
+  # against.
   min_improvement: 0.001
   state_path: "state.json"
   # Dotted "module:function" implementing (preds, truth) -> (score, reason) -
