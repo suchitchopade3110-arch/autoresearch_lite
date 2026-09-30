@@ -299,20 +299,39 @@ def main():
         generation_usage = getattr(patch_generator.llm_client, "last_usage", {}) or {}
 
         if not apply_success:
-            candidate_logger.warning("Patch application failed (malformed diff). Rejecting candidate.")
-            db.store_experiment(
-                hypothesis=goal,
-                diff=diff,
-                rationale="Prompt generated malformed diff",
-                metrics={},
-                outcome="failure",
-                failure_reason="Malformed diff rejected by git apply.",
-                # The real git-apply diagnostic (e.g. "error: patch failed:
-                # file.py:10"), not just this generic label - without it,
-                # every malformed-diff failure record looked identical
-                # regardless of what was actually wrong with that diff.
-                traceback=patch_generator.last_apply_error or None,
-            )
+            if patch_generator.last_failure_was_provider_error:
+                # Transport/HTTP failure talking to the LLM provider itself
+                # (rate limit, 5xx, connection error) - a different failure
+                # mode than a successful call that just produced a diff git
+                # couldn't apply. Left uncaught, this used to propagate out
+                # of generate_and_apply() and crash the whole orchestrator
+                # run over one candidate's transient provider hiccup.
+                candidate_logger.warning("LLM provider error during generation. Rejecting candidate.")
+                db.store_experiment(
+                    hypothesis=goal,
+                    diff=diff,
+                    rationale="LLM provider error during generation",
+                    metrics={},
+                    outcome="failure",
+                    failure_reason="provider-error",
+                    traceback=patch_generator.last_apply_error or None,
+                )
+            else:
+                candidate_logger.warning("Patch application failed (malformed diff). Rejecting candidate.")
+                db.store_experiment(
+                    hypothesis=goal,
+                    diff=diff,
+                    rationale="Prompt generated malformed diff",
+                    metrics={},
+                    outcome="failure",
+                    failure_reason="Malformed diff rejected by git apply.",
+                    # The real git-apply diagnostic (e.g. "error: patch
+                    # failed: file.py:10"), not just this generic label -
+                    # without it, every malformed-diff failure record
+                    # looked identical regardless of what was actually
+                    # wrong with that diff.
+                    traceback=patch_generator.last_apply_error or None,
+                )
             vcs.rollback(branch_name, worktree_path)
             return False, 0.0
 

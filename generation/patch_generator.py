@@ -2,12 +2,28 @@ from abc import ABC, abstractmethod
 import os
 import subprocess
 import tempfile
+import time
 from typing import Iterable, List, Optional, Tuple, Union
 
 from observability.logging_config import get_logger
 from vcs.diff_guard import validate_diff_scope
 
 _module_logger = get_logger(__name__)
+
+
+class ProviderError(Exception):
+    """
+    Raised by an LLMClient.generate_diff() implementation when the LLM
+    provider itself fails (rate limit, 5xx, connection/timeout error) -
+    distinct from a malformed diff, which is a successful API call that
+    just produced text that doesn't apply. Left uncaught, this used to
+    propagate all the way out of PatchGenerator.generate_and_apply() and
+    kill the whole orchestrator process over a single candidate's transient
+    provider hiccup (observed live: a 429 from Groq during generate_diff).
+    PatchGenerator.generate_and_apply() catches this and reports it as a
+    failed candidate instead.
+    """
+    pass
 
 class LLMClient(ABC):
     @abstractmethod
@@ -188,7 +204,18 @@ class AnthropicClient(LLMClient):
         # MockLLMClient, so callers must getattr(..., "last_usage", None).
         self.last_usage = {}
 
+    # Rate-limit-only backoff schedule (seconds) for generate_diff's API
+    # call, separate from max_apply_retries: a 429 is worth a few short
+    # waits since the provider is telling us to slow down and try again,
+    # but a 5xx/connection error gets none of these - it fails fast into a
+    # ProviderError so the caller can record the candidate as failed and
+    # move on, rather than the run stalling on an outage that may not
+    # clear soon.
+    _RATE_LIMIT_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+
     def generate_diff(self, prompt: str, target_file: str, current_content: str = "") -> str:
+        import anthropic
+
         feedback = ""
         diff = ""
         total_input = 0
@@ -199,15 +226,32 @@ class AnthropicClient(LLMClient):
             if feedback:
                 user_content += f"\n\n--- PREVIOUS ATTEMPT FAILED TO APPLY (git apply --check stderr) ---\n{feedback}"
 
-            # temperature/top_p/top_k are deliberately never sent: Claude
-            # Sonnet 5 (and the Opus 4.7/4.8 family) reject non-default
-            # sampling parameters outright.
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=self.DIFF_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_content}],
-            )
+            response = None
+            last_rate_limit_error = None
+            for backoff_seconds in (0.0,) + self._RATE_LIMIT_BACKOFF_SECONDS:
+                if backoff_seconds:
+                    time.sleep(backoff_seconds)
+                try:
+                    # temperature/top_p/top_k are deliberately never sent:
+                    # Claude Sonnet 5 (and the Opus 4.7/4.8 family) reject
+                    # non-default sampling parameters outright.
+                    response = self.client.messages.create(
+                        model=self.model,
+                        max_tokens=self.max_tokens,
+                        system=self.DIFF_SYSTEM_PROMPT,
+                        messages=[{"role": "user", "content": user_content}],
+                    )
+                    last_rate_limit_error = None
+                    break
+                except anthropic.RateLimitError as e:
+                    last_rate_limit_error = e
+                    continue
+                except anthropic.APIError as e:
+                    raise ProviderError(f"Anthropic API error: {e}") from e
+
+            if response is None:
+                raise ProviderError(f"Anthropic rate limit persisted after retries: {last_rate_limit_error}")
+
             total_input += response.usage.input_tokens
             total_output += response.usage.output_tokens
 
@@ -259,7 +303,13 @@ class LocalLLMClient(LLMClient):
         # AnthropicClient.last_usage - estimated_cost_usd is always 0.0.
         self.last_usage = {}
 
+    # Same rate-limit-only backoff rationale as AnthropicClient - a 429
+    # gets a few short waits, a 5xx/connection error fails fast.
+    _RATE_LIMIT_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+
     def generate_diff(self, prompt: str, target_file: str, current_content: str = "") -> str:
+        import httpx
+
         feedback = ""
         diff = ""
         total_input = 0
@@ -270,15 +320,35 @@ class LocalLLMClient(LLMClient):
             if feedback:
                 user_content += f"\n\n--- PREVIOUS ATTEMPT FAILED TO APPLY (git apply --check stderr) ---\n{feedback}"
 
-            response = self.client.post(f"{self.base_url}/chat/completions", json={
-                "model": self.model,
-                "max_tokens": self.max_tokens,
-                "messages": [
-                    {"role": "system", "content": self.DIFF_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content},
-                ],
-            })
-            response.raise_for_status()
+            response = None
+            last_rate_limit_error = None
+            for backoff_seconds in (0.0,) + self._RATE_LIMIT_BACKOFF_SECONDS:
+                if backoff_seconds:
+                    time.sleep(backoff_seconds)
+                try:
+                    candidate_response = self.client.post(f"{self.base_url}/chat/completions", json={
+                        "model": self.model,
+                        "max_tokens": self.max_tokens,
+                        "messages": [
+                            {"role": "system", "content": self.DIFF_SYSTEM_PROMPT},
+                            {"role": "user", "content": user_content},
+                        ],
+                    })
+                    candidate_response.raise_for_status()
+                    response = candidate_response
+                    last_rate_limit_error = None
+                    break
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 429:
+                        last_rate_limit_error = e
+                        continue
+                    raise ProviderError(f"Local LLM server HTTP error: {e}") from e
+                except httpx.RequestError as e:
+                    raise ProviderError(f"Local LLM server connection error: {e}") from e
+
+            if response is None:
+                raise ProviderError(f"Local LLM server rate limit persisted after retries: {last_rate_limit_error}")
+
             body = response.json()
             usage = body.get("usage") or {}  # not every local server reports this
             total_input += usage.get("prompt_tokens", 0)
@@ -383,6 +453,14 @@ class PatchGenerator:
         # call, the same way AnthropicClient.last_usage is read immediately
         # after generate_diff.
         self.last_apply_error: str = ""
+        # True only when generate_and_apply()'s False return is because the
+        # LLM provider itself failed (ProviderError - rate limit, 5xx,
+        # connection error), as opposed to a successful call that produced
+        # a diff git couldn't apply. Callers (orchestrator/run.py) read
+        # this immediately after the call to record the right failure
+        # category instead of lumping every failure in with "malformed
+        # diff".
+        self.last_failure_was_provider_error: bool = False
 
     def generate_and_apply(self, prompt: str, target_file: Union[str, List[str]], cwd: Optional[str] = None, logger=None) -> bool:
         """
@@ -407,6 +485,7 @@ class PatchGenerator:
         log = logger or _module_logger
         target_files = [target_file] if isinstance(target_file, str) else list(target_file)
         self.last_apply_error = ""
+        self.last_failure_was_provider_error = False
 
         diffs = []
         for f in target_files:
@@ -417,7 +496,13 @@ class PatchGenerator:
             except FileNotFoundError:
                 current_content = ""
 
-            diff = self.llm_client.generate_diff(prompt, f, current_content)
+            try:
+                diff = self.llm_client.generate_diff(prompt, f, current_content)
+            except ProviderError as e:
+                log.warning(f"LLM provider error generating diff for {f}: {e}")
+                self.last_apply_error = str(e)
+                self.last_failure_was_provider_error = True
+                return False, "\n".join(diffs)
             log.info(f"Generated diff:\n{diff}")
             diffs.append(diff)
 

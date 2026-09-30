@@ -4,7 +4,7 @@ import json
 import random
 from typing import List, Dict, Any, Optional
 from generation.prompt_builder import PromptBuilder
-from generation.patch_generator import PatchGenerator, validate_and_apply_patch
+from generation.patch_generator import PatchGenerator, ProviderError, validate_and_apply_patch
 from memory.db import ExperimentDB
 from evolution.duplicate_checker import is_duplicate
 from evolution.scheduler import ConcurrentScheduler
@@ -100,7 +100,20 @@ class EvolutionEngine:
             if mutation_context:
                 prompt += f"\nMutation Instruction: {mutation_context}"
 
-            diff = self.patch_generator.llm_client.generate_diff(prompt, "candidate_script.py", current_content)
+            try:
+                diff = self.patch_generator.llm_client.generate_diff(prompt, "candidate_script.py", current_content)
+            except ProviderError as e:
+                # LLM provider failure (rate limit, 5xx, connection error) -
+                # left uncaught this used to propagate out and crash the
+                # whole evolutionary run over one candidate's transient
+                # provider hiccup, same failure mode fixed in
+                # orchestrator/run.py's sequential path. Treated like any
+                # other exhausted-retries rejection: rolled back, counted,
+                # and the generation moves on without this candidate.
+                candidate_logger.warning(f"LLM provider error during generation: {e}")
+                last_rejection = "provider-error"
+                self._last_malformed_detail = str(e)
+                continue
             # Captured immediately, not read later from the shared
             # llm_client - candidates are generated in a batch before any
             # scheduling happens, so by schedule time last_usage would only
